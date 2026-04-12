@@ -22,6 +22,10 @@ def load_repo(path) -> RepoInfo:
 
 
 def _git(path: Path, args: list) -> str:
-    return subprocess.check_output(
-        ["git", "-C", str(path)] + args, text=True
-    ).strip()
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(path)] + args, text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
