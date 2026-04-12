@@ -15,6 +15,8 @@ def load_repo(path) -> RepoInfo:
     p = Path(path).resolve()
     if p.is_file():
         p = p.parent
+    root   = _git(p, ["rev-parse", "--show-toplevel"])
+    p      = Path(root) if root else p
     sha    = _git(p, ["rev-parse", "HEAD"])
     branch = _git(p, ["rev-parse", "--abbrev-ref", "HEAD"])
     dirty  = _git(p, ["status", "--porcelain"]) != ""
