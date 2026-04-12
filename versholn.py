@@ -1,6 +1,10 @@
+import importlib
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+_importx_cache: dict = {}
 
 
 @dataclass
@@ -31,3 +35,36 @@ def _git(path: Path, args: list) -> str:
         ).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return ""
+
+
+def importx(dotted: str, *, local: str | None = None):
+    """Lazy, cached import for own-repo symbols. Call inside functions, never at module level."""
+    if dotted in _importx_cache:
+        return _importx_cache[dotted]
+
+    module_path, _, attr = dotted.rpartition(".")
+    if not module_path:
+        raise ImportError(f"versholn.importx: dotted must include a module and attribute, got: {dotted!r}")
+
+    if local is not None:
+        p = Path(local)
+        if not p.exists():
+            raise ImportError(f"versholn.importx: local path not found: {local}")
+        _prepend_path(str(p))
+    else:
+        top_pkg = module_path.split(".")[0]
+        caller_root = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
+        if caller_root:
+            sibling = Path(caller_root).parent / top_pkg
+            if sibling.exists():
+                _prepend_path(str(sibling))
+
+    mod = importlib.import_module(module_path)
+    symbol = getattr(mod, attr)
+    _importx_cache[dotted] = symbol
+    return symbol
+
+
+def _prepend_path(p: str) -> None:
+    if p not in sys.path:
+        sys.path.insert(0, p)
