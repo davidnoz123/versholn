@@ -46,12 +46,17 @@ def _git(path: Path, args: list) -> str:
 
 
 def importx(dotted: str, *, local: str | None = None):
-    """Lazy, cached import for own-repo symbols. Call inside functions, never at module level."""
+    """Lazy, cached import for own-repo symbols. Call inside functions, never at module level.
+
+    Resolves dotted paths left-to-right: tries each split point from longest module
+    path to shortest, chaining getattr for any remaining components. This handles
+    module.submodule.func as well as module.Class.method.
+    """
     if dotted in _importx_cache:
         return _importx_cache[dotted]
 
-    module_path, _, attr = dotted.rpartition(".")
-    if not module_path:
+    parts = dotted.split(".")
+    if len(parts) < 2:
         raise ImportError(f"versholn.importx: dotted must include a module and attribute, got: {dotted!r}")
 
     if local is not None:
@@ -60,17 +65,59 @@ def importx(dotted: str, *, local: str | None = None):
             raise ImportError(f"versholn.importx: local path not found: {local}")
         _prepend_path(str(p))
     else:
-        top_pkg = module_path.split(".")[0]
+        top_pkg = parts[0]
         caller_root = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
         if caller_root:
             sibling = Path(caller_root).parent / top_pkg
             if sibling.exists():
                 _prepend_path(str(sibling))
 
-    mod = importlib.import_module(module_path)
-    symbol = getattr(mod, attr)
-    _importx_cache[dotted] = symbol
-    return symbol
+    # Try splits right-to-left: longest module path first, fall back on ImportError.
+    for split in range(len(parts) - 1, 0, -1):
+        try:
+            mod = importlib.import_module(".".join(parts[:split]))
+            obj = mod
+            for attr in parts[split:]:
+                obj = getattr(obj, attr)
+            _importx_cache[dotted] = obj
+            return obj
+        except (ImportError, AttributeError):
+            continue
+
+    raise ImportError(f"versholn.importx: cannot resolve {dotted!r}")
+
+
+def install_and_import(package_spec: str, *, import_as: str | None = None):
+    """Ensure a PyPI package is installed then import and return the module.
+
+    Call inside functions, never at module level.
+
+    In production, versholn.bootstrap() should have already installed the package
+    via the compat.json pip section. This function is the graceful fallback for
+    local dev and for the first call before bootstrap runs.
+
+    Args:
+        package_spec: pip install spec, e.g. "httpx" or "httpx>=0.25".
+        import_as: module name to import if different from the package name,
+                   e.g. install_and_import("Pillow", import_as="PIL").
+    """
+    import_name = import_as or package_spec.split("[")[0].split(">")[0].split("<")[0].split("=")[0].split("!")[0].strip()
+    cache_key = f"__pip__{import_name}"
+    if cache_key in _importx_cache:
+        return _importx_cache[cache_key]
+
+    try:
+        mod = importlib.import_module(import_name)
+    except ImportError:
+        _log.info("versholn.install_and_import: installing %s", package_spec)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", package_spec],
+            stdout=subprocess.DEVNULL,
+        )
+        mod = importlib.import_module(import_name)
+
+    _importx_cache[cache_key] = mod
+    return mod
 
 
 def _prepend_path(p: str) -> None:
@@ -191,6 +238,11 @@ def bootstrap(
         and not my_sha.startswith(versholn_entry["sha"])
     )
 
+    # Install PyPI packages declared in the compat pip section (schema 2+).
+    pip_specs = compat.get("pip", {})
+    if pip_specs:
+        _pip_install_from_compat(pip_specs)
+
     cloned: dict = {}
 
     for url, repo_info in repos.items():
@@ -227,6 +279,31 @@ def bootstrap(
     if versholn_entry:
         _bootstrap_state["repos"][my_url] = versholn_entry["sha"]
     return sys.modules[__name__]
+
+
+def _pip_install_from_compat(pip_specs: dict) -> None:
+    """Install PyPI packages from the compat.json pip section.
+
+    pip_specs maps pip package name -> version spec string, e.g.
+        {"httpx": ">=0.25", "some-pkg": "1.2.3"}
+
+    Skips packages already importable at the right version to avoid redundant
+    installs on warm restarts.
+    """
+    import importlib.util
+    to_install = []
+    for pkg, spec in pip_specs.items():
+        import_name = pkg.replace("-", "_")
+        if importlib.util.find_spec(import_name) is None:
+            to_install.append(f"{pkg}{spec}" if spec else pkg)
+        else:
+            _log.debug("versholn._pip_install_from_compat: %s already importable, skipping", pkg)
+    if to_install:
+        _log.info("versholn._pip_install_from_compat: installing %s", to_install)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + to_install,
+            stdout=subprocess.DEVNULL,
+        )
 
 
 def _clone_at_sha(url: str, sha: str, dest: Path, *, pat: str | None = None) -> None:
