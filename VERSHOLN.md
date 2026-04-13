@@ -542,6 +542,174 @@ The config service and versholn-db are complementary:
 
 ---
 
+## Dependency Manifest — `versholn.toml`
+
+### Problem
+
+The current bootstrap design requires `compat.json` to enumerate every repo explicitly. But the Docker
+image should only need to know its **seed repo** — versholn should walk the dependency graph and discover
+everything else automatically.
+
+### Per-Repo Manifest
+
+Each repo declares its own dependencies in a `versholn.toml` at its root. Versholn reads this file after
+cloning each repo and uses it to discover the next layer of the graph.
+
+```toml
+# nielsoln_site/versholn.toml
+[repo]
+name = "nielsoln_site"
+url  = "https://github.com/davidnoz123/nielsoln_site.git"
+
+[deps.geo_tools]
+url     = "https://github.com/davidnoz123/geo_tools.git"
+private = true
+```
+
+```toml
+# geo_tools/versholn.toml
+[repo]
+name = "geo_tools"
+url  = "https://github.com/davidnoz123/geo_tools.git"
+
+# no [deps] — leaf node
+```
+
+```toml
+# versholn/versholn.toml
+[repo]
+name = "versholn"
+url  = "https://github.com/davidnoz123/versholn.git"
+
+# no [deps] — leaf node
+```
+
+### Graph Resolution
+
+The Docker image / `entrypoint.py` only specifies the seed:
+
+```
+VERSHOLN_SERVICE_ID = "nielsoln_site"
+VERSHOLN_COMPAT_URL = "https://raw.githubusercontent.com/.../compat.json"
+```
+
+Bootstrap then:
+1. Fetches `compat.json` → gets all known-good SHAs
+2. Clones seed repo (`nielsoln_site`) at its compat SHA
+3. Reads `versholn.toml` → discovers `geo_tools`
+4. Clones `geo_tools` at its compat SHA
+5. Reads `geo_tools/versholn.toml` → no more deps
+6. Graph complete — all repos cloned
+
+`compat.json` remains the SHA authority. The manifest describes graph *shape*; compat provides *versions*.
+
+---
+
+## Version Anchoring
+
+An anchor overrides the compat record for a specific repo — use your chosen SHA regardless of what
+compat says. Two anchor levels:
+
+### Committed Anchor (in `versholn.toml`)
+
+Stable long-term pin, committed to the repo. Survives redeployment:
+
+```toml
+[deps.geo_tools]
+url    = "https://github.com/davidnoz123/geo_tools.git"
+anchor = "9c94dce"   # always use this SHA, compat record ignored for this dep
+```
+
+### Runtime Anchor (env var)
+
+One-off override for testing without a commit. Set at `docker run` or in the Cloud Run revision:
+
+```
+VERSHOLN_ANCHOR_GEO_TOOLS = 9c94dce
+```
+
+Naming convention: `VERSHOLN_ANCHOR_<REPO_NAME_UPPERCASE>`. Bootstrap reads all env vars matching
+this pattern before resolution begins.
+
+### Precedence
+
+```
+Runtime anchor (env var)         → highest — overrides everything, no compat check
+Committed anchor (versholn.toml) → overrides compat, subject to on_incompatible policy
+compat.json SHA                  → default for all unanchored repos
+```
+
+Runtime anchors **skip incompatibility checks** by design — they are explicit developer overrides.
+
+---
+
+## Incompatibility Reactions
+
+### Scenarios
+
+Three distinct incompatibility scenarios can arise during graph resolution:
+
+| Scenario | Description |
+|---|---|
+| **Constraint violation** | A dep's compat SHA doesn't satisfy the `min_sha` or `branch` constraint in `versholn.toml` |
+| **Transitive conflict** | Two repos in the graph require different versions of the same shared dep |
+| **Anchor vs compat mismatch** | A committed anchor references a SHA not present in the compat record |
+
+### Per-Dep Reaction Policy
+
+Configured in `versholn.toml` per dep:
+
+```toml
+[deps.geo_tools]
+url             = "https://github.com/davidnoz123/geo_tools.git"
+on_incompatible = "fail"    # default — hard abort, container won't start
+                             # "warn"   — log warning, use compat SHA anyway
+                             # "anchor" — use committed anchor SHA regardless
+```
+
+### System-Wide Defaults
+
+Set at the top of `versholn.toml`:
+
+```toml
+[versholn]
+on_incompatible     = "fail"     # default for all deps that don't set it explicitly
+conflict_resolution = "compat"   # transitive conflict strategy:
+                                  # "compat"  — trust compat record (default)
+                                  # "latest"  — newest SHA in ancestry order wins
+                                  # "strict"  — fail on any transitive conflict
+```
+
+### Reaction Reference
+
+| `on_incompatible` | Behaviour |
+|---|---|
+| `"fail"` (default) | Bootstrap aborts immediately with a structured error log. Container does not start. |
+| `"warn"` | Logs a WARNING, continues with the compat SHA. Useful for non-critical deps. |
+| `"anchor"` | Uses the committed anchor SHA, logs that compat was bypassed. |
+
+| `conflict_resolution` | Behaviour |
+|---|---|
+| `"compat"` (default) | Compat record is authoritative for all transitive conflicts. |
+| `"latest"` | The SHA that is a descendant of the other wins. |
+| `"strict"` | Any transitive conflict aborts bootstrap regardless of `on_incompatible`. |
+
+### Error Log on Incompatibility
+
+```json
+{
+  "schema": 1, "level": "ERROR", "logger": "versholn.bootstrap",
+  "msg": "incompatible dep: constraint not satisfied",
+  "repo": "geo_tools",
+  "constraint": "min_sha",
+  "required": "9c94dce",
+  "got": "abc1234",
+  "action": "fail"
+}
+```
+
+---
+
 ## Logging Policy
 
 ### Why Structured Logs Matter Here
