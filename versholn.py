@@ -92,7 +92,7 @@ def version_info() -> dict:
 
     my_root = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
     if not my_root:
-        return {"mode": "local", "versholn_sha": "unknown"}
+        return {"mode": "local", "repos": {}}
 
     siblings_root = Path(my_root).parent
     repos = {}
@@ -101,11 +101,11 @@ def version_info() -> dict:
             continue
         sha = _git(sibling, ["rev-parse", "HEAD"])
         if sha:
-            repos[sibling.name] = sha
+            url = _git(sibling, ["remote", "get-url", "origin"]) or sibling.name
+            repos[url] = sha
 
     return {
         "mode": "local",
-        "versholn_sha": _git(Path(__file__).parent, ["rev-parse", "HEAD"]) or "unknown",
         "repos": repos,
     }
 
@@ -151,10 +151,11 @@ def bootstrap(
         _log.info("versholn.bootstrap: cloning %s @ %s", repo_name, sha)
         _clone_at_sha(url, sha, dest, pat=pat if is_private else None)
         _prepend_path(str(dest))
-        cloned[repo_name] = sha
+        cloned[url] = sha
 
     _bootstrap_state.update({
         "compat_url": compat_url,
+        "clone_root": clone_root,
         "bootstrapped_at": datetime.datetime.utcnow().isoformat() + "Z",
         "repos": cloned,
     })
@@ -168,10 +169,11 @@ def bootstrap(
         import versholn as _new
         importlib.reload(_new)
         _new._bootstrap_state.update(_bootstrap_state)
-        _new._bootstrap_state["repos"]["versholn"] = new_sha
+        _new._bootstrap_state["repos"][versholn_entry["url"]] = new_sha
         return _new
 
-    _bootstrap_state["repos"]["versholn"] = my_sha
+    if versholn_entry:
+        _bootstrap_state["repos"][versholn_entry["url"]] = versholn_entry["sha"]
     return sys.modules[__name__]
 
 
