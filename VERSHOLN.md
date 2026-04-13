@@ -435,3 +435,107 @@ will be added to versholn when a second consumer exists.
 Locally, `importx` and the sibling convention continue to work as-is. `bootstrap()` is never called
 locally — `entrypoint.py` is only the production container entry point. The local server command
 (in AGENTS.md) remains the same.
+
+---
+
+## Runtime Configuration — Making the Image Generic
+
+### Problem
+
+If the per-service config (which repos to clone, what to run) is baked into the image, changing the
+config requires a rebuild. The goal is an image that is **completely generic** — same image, different
+behaviour, depending only on what is passed in or fetched at startup.
+
+### Approach 1 — Environment Variables
+
+The simplest form. Pass config to `docker run` or set it in the Cloud Run revision:
+
+```
+VERSHOLN_COMPAT_URL   = URL to fetch compat.json from
+VERSHOLN_SERVICE_ID   = logical name of this service (e.g. "nielsoln-be")
+VERSHOLN_ENTRYPOINT   = command to exec after bootstrap (e.g. "uvicorn main:app --host 0.0.0.0 --port 8080")
+GITHUB_PAT            = PAT for private repo cloning
+```
+
+`entrypoint.py` reads these vars. The image itself has no hardcoded opinion about which repos it needs
+or what it runs — that is all supplied at deploy time.
+
+**Locally:**
+```powershell
+docker run -e VERSHOLN_COMPAT_URL=... -e VERSHOLN_SERVICE_ID=nielsoln-be -e GITHUB_PAT=... nielsoln-be
+```
+
+**Cloud Run:**
+Env vars set in Cloud Run service config; `GITHUB_PAT` mounted from Secret Manager.
+
+### Approach 2 — Config Service (Call-Out on Startup)
+
+Instead of passing config as env vars, the container calls a versholn config endpoint at startup:
+
+```
+GET <VERSHOLN_CONFIG_URL>/config/<VERSHOLN_SERVICE_ID>
+→ returns: repos to clone, version constraints, entrypoint command
+```
+
+The container only needs two env vars: `VERSHOLN_CONFIG_URL` and `VERSHOLN_SERVICE_ID`.
+Everything else — which repos, which SHAs, what to run — is served dynamically by the config service.
+
+```json
+{
+  "schema": 1,
+  "service": "nielsoln-be",
+  "compat_url": "https://raw.githubusercontent.com/davidnoz123/versholn-db/main/compat.json",
+  "entrypoint": "uvicorn main:app --host 0.0.0.0 --port 8080",
+  "version_constraints": {
+    "geo_tools": { "min_sha": "9c94dce", "branch": "1.0" }
+  }
+}
+```
+
+The config service itself can be a simple Cloud Run service or a raw file served from versholn-db.
+
+### Version Constraints
+
+The compat record pins SHAs absolutely. Version constraints (in the service config) express requirements
+that the compat resolver must satisfy before cloning:
+
+| Constraint | Meaning |
+|---|---|
+| `min_sha` | The cloned SHA must be a descendant of this SHA |
+| `branch` | The SHA must be on this branch (maps to virtual tag `<major>.<minor>`) |
+| `exact_sha` | Override compat record — use this SHA regardless |
+
+If the compat record cannot satisfy the constraints, bootstrap fails loudly with a clear error.
+This is the **compatibility check** — the core of the versholn design.
+
+### Precedence
+
+```
+exact_sha in service config  →  highest priority (hard override)
+compat.json SHA              →  normal case
+min_sha constraint           →  validation only, does not select
+```
+
+### Relation to versholn-db
+
+The config service and versholn-db are complementary:
+
+| | versholn-db (`compat.json`) | Config service |
+|---|---|---|
+| Stores | Known-good SHA combinations | Per-service identity and requirements |
+| Updated by | Compat promotion (after testing) | Developer when service config changes |
+| Read by | `bootstrap()` at startup | `entrypoint.py` before bootstrap |
+| Scope | Ecosystem-wide | Per service |
+
+### Combined Startup Sequence (Full Picture)
+
+```
+1. Container starts
+2. entrypoint.py reads VERSHOLN_CONFIG_URL + VERSHOLN_SERVICE_ID
+3. Fetches service config → gets: compat_url, entrypoint, version_constraints
+4. Fetches compat.json from compat_url → gets: repo SHAs
+5. Validates SHAs against version_constraints → fail fast if not satisfied
+6. versholn.bootstrap() clones all repos at validated SHAs
+7. versholn self-updates if its SHA in compat differs from baked
+8. exec <entrypoint>  ← uvicorn/other becomes PID 1
+```
