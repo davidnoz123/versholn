@@ -99,6 +99,22 @@ def _github_head_sha(raw_url: str) -> str:
         return "unknown"
 
 
+def _pin_raw_url(raw_url: str, sha: str) -> str:
+    """Replace the branch/tag segment of a raw.githubusercontent.com URL with a commit SHA.
+
+    https://raw.githubusercontent.com/owner/repo/main/file.json
+    -> https://raw.githubusercontent.com/owner/repo/{sha}/file.json
+    """
+    try:
+        parts = raw_url.split("/")
+        idx = parts.index("raw.githubusercontent.com")
+        # parts[idx+3] is the branch; replace with sha
+        parts[idx + 3] = sha
+        return "/".join(parts)
+    except Exception:
+        return raw_url
+
+
 def version_info() -> dict:
     """Return version metadata for the current runtime environment.
 
@@ -143,10 +159,13 @@ def bootstrap(
     """
     _log.info("versholn.bootstrap: fetching compat record from %s", compat_url)
 
-    with urllib.request.urlopen(compat_url, timeout=30) as resp:
+    compat_sha = _github_head_sha(compat_url)
+    pinned_url = _pin_raw_url(compat_url, compat_sha) if compat_sha != "unknown" else compat_url
+    _log.info("versholn.bootstrap: compat SHA %s, fetching from %s", compat_sha, pinned_url)
+
+    with urllib.request.urlopen(pinned_url, timeout=30) as resp:
         compat = json.loads(resp.read().decode())
 
-    compat_sha = _github_head_sha(compat_url)
     clone_root_path = Path(clone_root)
     clone_root_path.mkdir(parents=True, exist_ok=True)
 
