@@ -78,6 +78,38 @@ def _prepend_path(p: str) -> None:
         sys.path.insert(0, p)
 
 
+def version_info() -> dict:
+    """Return version metadata for the current runtime environment.
+
+    Production (bootstrap has run): returns mode=production plus compat_url,
+    bootstrapped_at, and per-repo SHAs from the compat record.
+
+    Local dev (bootstrap never runs): returns mode=local plus the SHA of
+    each sibling repo detected via the sibling-dirs convention.
+    """
+    if _bootstrap_state:
+        return {"mode": "production", **_bootstrap_state}
+
+    my_root = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
+    if not my_root:
+        return {"mode": "local", "versholn_sha": "unknown"}
+
+    siblings_root = Path(my_root).parent
+    repos = {}
+    for sibling in sorted(siblings_root.iterdir()):
+        if not sibling.is_dir():
+            continue
+        sha = _git(sibling, ["rev-parse", "HEAD"])
+        if sha:
+            repos[sibling.name] = sha
+
+    return {
+        "mode": "local",
+        "versholn_sha": _git(Path(__file__).parent, ["rev-parse", "HEAD"]) or "unknown",
+        "repos": repos,
+    }
+
+
 def bootstrap(
     compat_url: str,
     clone_root: str = "/app/deps",
