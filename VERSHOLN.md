@@ -912,3 +912,165 @@ curl http://localhost:8080/api/health
 ```
 
 Add this to AGENTS.md alongside the local uvicorn command once `entrypoint.py` is implemented.
+
+---
+
+## Multi-Environment Compat Records
+
+The same generic image can target different environments simply by pointing `VERSHOLN_COMPAT_URL` at
+a different record. No image rebuild, no config change — just an env var swap.
+
+### Structure in versholn-db
+
+```
+versholn-db/
+  compat.json             ← prod (promoted, validated)
+  staging/compat.json     ← staging (newer, less validated)
+  dev/compat.json         ← latest main of each repo (auto-updated by CI)
+  history/                ← archived prod records for rollback
+    2026-04-13-compat.json
+```
+
+### Per-Environment URL Convention
+
+| Environment | `VERSHOLN_COMPAT_URL` |
+|---|---|
+| Production | `.../versholn-db/main/compat.json` |
+| Staging | `.../versholn-db/main/staging/compat.json` |
+| Dev | `.../versholn-db/main/dev/compat.json` |
+
+Staging can run newer SHAs than prod without any image difference. The same `nielsoln-be` image serves
+all three environments — differentiated only by the compat URL in the Cloud Run service config.
+
+---
+
+## Health Endpoint — Bootstrap Metadata
+
+Post-bootstrap, the `/api/health` endpoint should surface which SHA set is actually running. This gives
+an instant answer to "what's deployed?" without digging into logs.
+
+### Response Shape
+
+```json
+{
+  "ok": true,
+  "versholn_sha": "4c63ed9",
+  "repos": {
+    "geo_tools": "9c94dce",
+    "versholn":  "4c63ed9"
+  },
+  "compat_url": "https://raw.githubusercontent.com/davidnoz123/versholn-db/main/compat.json",
+  "bootstrapped_at": "2026-04-13T10:00:00Z"
+}
+```
+
+Versholn populates a module-level `_bootstrap_state` dict after `bootstrap()` completes. The health
+endpoint reads from it — no additional work per request.
+
+The extended shape is **additive** — older clients that only check `ok: true` continue to work.
+
+---
+
+## `runs.jsonl` Persistence in Production
+
+Run records are currently designed for a local filesystem. Cloud Run has an **ephemeral filesystem** —
+records are lost on every restart, scale-out, or redeploy.
+
+### Options
+
+| Option | Complexity | Cost | Suitable for |
+|---|---|---|---|
+| **Ephemeral** (current) | None | None | Dev/local only |
+| **Stream to Cloud Logging** | Low | Low | Audit trail via log sink |
+| **Write to GCS bucket** | Medium | Negligible | Durable records + replay |
+| **Cloud Run volume (NFS)** | Medium | Low | Shared across instances |
+
+### Recommended path
+
+Phase 1 — Stream minimal run records to Cloud Logging as structured JSON (same envelope as
+`run_start`/`run_finish`). Cloud Logging retains for 30 days by default; export sink to GCS for
+longer retention. Zero infra to set up.
+
+Phase 2 — When run record volume or query requirements grow, write directly to GCS in JSONL. The
+`$ref` / `vshn://` URI system already anticipates remote storage — just register a GCS resolver.
+
+### Decision Needed Before Implementation
+
+`start_run()` / `finish_run()` need to know their write target. Controlled by `versholn.toml`:
+
+```toml
+[versholn]
+run_record_target = "stdout"   # default — ephemeral, goes to Cloud Logging
+                                # "gcs"    — write to GCS (requires VERSHOLN_GCS_BUCKET env var)
+                                # "file"   — local file (local dev default)
+```
+
+---
+
+## Optional Dependencies
+
+Not all deps are hard requirements. A `required = false` flag allows graceful degradation if a dep
+cannot be resolved (missing from compat, clone fails, private and no PAT):
+
+```toml
+[deps.analytics_tools]
+url      = "https://github.com/davidnoz123/analytics_tools.git"
+required = false   # log WARNING, continue without it
+```
+
+Code that uses an optional dep must guard with `versholn.importx()` catching `ImportError`:
+
+```python
+def get_analytics():
+    try:
+        return versholn.importx("analytics_tools.core.Client")
+    except ImportError:
+        return None   # feature unavailable, degrade gracefully
+```
+
+---
+
+## Image Tagging Convention
+
+With a generic image, `latest` is ambiguous — "latest" image + any compat record = any behaviour.
+Tag images by the **baked versholn SHA** to make the bootstrapper version auditable:
+
+```
+gcr.io/plucky-snowfall-442701-s1/nielsoln-be:vshn-4c63ed9
+```
+
+The image tag identifies the bootstrapper. The actual app and dep SHAs come from the compat record
+at runtime. Together they fully define what ran:
+
+```
+image tag (bootstrapper version) + compat_url + compat SHA set = fully reproducible deploy
+```
+
+Update `cloudbuild.yaml` to tag by versholn SHA once bootstrap is implemented.
+
+---
+
+## Bootstrap Failure Alerting — Startup Probe
+
+Cloud Run supports **startup probes** — if the health endpoint doesn't return 200 within the probe
+window, Cloud Run marks the instance unhealthy and routes traffic to other instances.
+
+### Recommended probe config (Cloud Run service YAML)
+
+```yaml
+containers:
+  startupProbe:
+    httpGet:
+      path: /api/health
+      port: 8080
+    initialDelaySeconds: 5    # allow time for git clones
+    periodSeconds: 5
+    failureThreshold: 6       # 30s total before Cloud Run gives up
+    timeoutSeconds: 3
+```
+
+`initialDelaySeconds` should be tuned to expected cold-start clone time. If bootstrap fails (bad
+compat record, unreachable repo), the health endpoint never returns 200 → probe fails → Cloud Run
+automatically rolls back to the previous revision.
+
+This makes the startup probe the **first line of defence** against a bad compat record deploy.
