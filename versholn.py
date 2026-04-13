@@ -78,6 +78,27 @@ def _prepend_path(p: str) -> None:
         sys.path.insert(0, p)
 
 
+def _github_head_sha(raw_url: str) -> str:
+    """Given a raw.githubusercontent.com URL, return the HEAD commit SHA of that branch.
+
+    E.g. https://raw.githubusercontent.com/owner/repo/main/file.json
+    -> GET https://api.github.com/repos/owner/repo/commits/main -> sha
+
+    Returns 'unknown' if the URL is not a GitHub raw URL or the request fails.
+    """
+    try:
+        parts = raw_url.split("/")
+        # https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{...}
+        idx = parts.index("raw.githubusercontent.com")
+        owner, repo, branch = parts[idx + 1], parts[idx + 2], parts[idx + 3]
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}"
+        req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github.sha"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode().strip()
+    except Exception:
+        return "unknown"
+
+
 def version_info() -> dict:
     """Return version metadata for the current runtime environment.
 
@@ -125,6 +146,7 @@ def bootstrap(
     with urllib.request.urlopen(compat_url, timeout=30) as resp:
         compat = json.loads(resp.read().decode())
 
+    compat_sha = _github_head_sha(compat_url)
     clone_root_path = Path(clone_root)
     clone_root_path.mkdir(parents=True, exist_ok=True)
 
@@ -155,6 +177,7 @@ def bootstrap(
 
     _bootstrap_state.update({
         "compat_url": compat_url,
+        "compat_sha": compat_sha,
         "clone_root": clone_root,
         "bootstrapped_at": datetime.datetime.utcnow().isoformat() + "Z",
         "repos": cloned,
