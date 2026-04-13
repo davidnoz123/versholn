@@ -313,11 +313,13 @@ versholn_db/
   "schema": 1,
   "promoted_at": "2026-04-13T10:00:00Z",
   "repos": {
-    "versholn":  { "sha": "4c63ed9", "url": "https://github.com/davidnoz123/versholn.git" },
-    "geo_tools": { "sha": "9c94dce", "url": "https://github.com/davidnoz123/geo_tools.git", "private": true }
+    "versholn":  { "sha": "4dcd31bc8fa2dba68bd9cc20c825ed9564b3053f", "url": "https://github.com/davidnoz123/versholn.git" },
+    "geo_tools": { "sha": "9c94dceb90ae6928afa41ec44dfd079064573ded", "url": "https://github.com/davidnoz123/geo_tools.git", "private": true }
   }
 }
 ```
+
+**SHAs must be full 40-character object SHAs.** Short SHAs are not accepted — `git fetch --depth 1 origin <sha>` requires the full SHA.
 
 **Public repo** — compat records contain only SHAs and metadata, no secrets. Any consumer can fetch
 `compat.json` via raw GitHub URL with no auth.
