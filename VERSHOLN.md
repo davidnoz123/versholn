@@ -297,12 +297,12 @@ current at build time.
 
 ---
 
-### versholn-db Repo
+### versholn_db Repo
 
-A new public GitHub repo — `versholn-db` — is the single source of truth for known-good SHA combinations.
+A new public GitHub repo — `versholn_db` — is the single source of truth for known-good SHA combinations.
 
 ```
-versholn-db/
+versholn_db/
   compat.json        ← the current promoted compat set
   history/           ← archived compat records (future)
 ```
@@ -330,7 +330,7 @@ New function in `versholn.py`. Called at container startup (from `entrypoint.py`
 
 ```python
 versholn.bootstrap(
-    compat_url="https://raw.githubusercontent.com/davidnoz123/versholn-db/main/compat.json",
+    compat_url="https://raw.githubusercontent.com/davidnoz123/versholn_db/main/compat.json",
     clone_root="/app/deps",
     pat=os.environ.get("GITHUB_PAT"),
 )
@@ -484,7 +484,7 @@ Everything else — which repos, which SHAs, what to run — is served dynamical
 {
   "schema": 1,
   "service": "nielsoln-be",
-  "compat_url": "https://raw.githubusercontent.com/davidnoz123/versholn-db/main/compat.json",
+  "compat_url": "https://raw.githubusercontent.com/davidnoz123/versholn_db/main/compat.json",
   "entrypoint": "uvicorn main:app --host 0.0.0.0 --port 8080",
   "version_constraints": {
     "geo_tools": { "min_sha": "9c94dce", "branch": "1.0" }
@@ -492,7 +492,7 @@ Everything else — which repos, which SHAs, what to run — is served dynamical
 }
 ```
 
-The config service itself can be a simple Cloud Run service or a raw file served from versholn-db.
+The config service itself can be a simple Cloud Run service or a raw file served from versholn_db.
 
 ### Version Constraints
 
@@ -516,11 +516,11 @@ compat.json SHA              →  normal case
 min_sha constraint           →  validation only, does not select
 ```
 
-### Relation to versholn-db
+### Relation to versholn_db
 
-The config service and versholn-db are complementary:
+The config service and versholn_db are complementary:
 
-| | versholn-db (`compat.json`) | Config service |
+| | versholn_db (`compat.json`) | Config service |
 |---|---|---|
 | Stores | Known-good SHA combinations | Per-service identity and requirements |
 | Updated by | Compat promotion (after testing) | Developer when service config changes |
@@ -813,7 +813,7 @@ missing from your local sibling tree.
 
 ### Unreachable Compat Record
 
-If `compat.json` cannot be fetched at cold start (network error, versholn-db down):
+If `compat.json` cannot be fetched at cold start (network error, versholn_db down):
 
 | Behaviour | Setting | When to use |
 |---|---|---|
@@ -841,11 +841,11 @@ If a bad compat record causes a container crash loop, the fix does not require a
 1. **Fast path** — set `VERSHOLN_ANCHOR_<REPO>=<known-good-sha>` in the Cloud Run revision env vars
 2. **Stable path** — point `VERSHOLN_COMPAT_URL` to a pinned historical record:
    ```
-   VERSHOLN_COMPAT_URL = https://raw.githubusercontent.com/davidnoz123/versholn-db/main/history/2026-04-13-compat.json
+   VERSHOLN_COMPAT_URL = https://raw.githubusercontent.com/davidnoz123/versholn_db/main/history/2026-04-13-compat.json
    ```
 3. **Nuclear option** — Cloud Run revision rollback to a previous revision (reverts all env vars + image)
 
-The `history/` directory in versholn-db is kept for exactly this purpose — every promoted compat record
+The `history/` directory in versholn_db is kept for exactly this purpose — every promoted compat record
 is archived with a timestamp before being overwritten.
 
 ### Cold Start Latency
@@ -880,7 +880,7 @@ The Minimal v0 design defers the CLI. Bootstrap adds the following planned comma
 
 | Command | Description |
 |---|---|
-| `versholn promote` | Resolve current local SHA set, validate compat constraints, write + push `compat.json` to versholn-db |
+| `versholn promote` | Resolve current local SHA set, validate compat constraints, write + push `compat.json` to versholn_db |
 | `versholn check` | Validate local checkouts against current compat record; warn on dirty/mismatched repos |
 | `versholn anchor <repo> <sha>` | Set a committed anchor in `versholn.toml` for a repo |
 | `versholn run <config>` | (v0) Run a configured set of repos as a versholn session |
@@ -901,7 +901,7 @@ docker build -t nielsoln-be be/
 
 # 2. Run with bootstrap config — simulates Cloud Run environment
 docker run --rm `
-  -e VERSHOLN_COMPAT_URL=https://raw.githubusercontent.com/davidnoz123/versholn-db/main/compat.json `
+  -e VERSHOLN_COMPAT_URL=https://raw.githubusercontent.com/davidnoz123/versholn_db/main/compat.json `
   -e VERSHOLN_SERVICE_ID=nielsoln_site `
   -e GITHUB_PAT=<your-pat> `
   -p 8080:8080 `
@@ -920,10 +920,10 @@ Add this to AGENTS.md alongside the local uvicorn command once `entrypoint.py` i
 The same generic image can target different environments simply by pointing `VERSHOLN_COMPAT_URL` at
 a different record. No image rebuild, no config change — just an env var swap.
 
-### Structure in versholn-db
+### Structure in versholn_db
 
 ```
-versholn-db/
+versholn_db/
   compat.json             ← prod (promoted, validated)
   staging/compat.json     ← staging (newer, less validated)
   dev/compat.json         ← latest main of each repo (auto-updated by CI)
@@ -935,9 +935,9 @@ versholn-db/
 
 | Environment | `VERSHOLN_COMPAT_URL` |
 |---|---|
-| Production | `.../versholn-db/main/compat.json` |
-| Staging | `.../versholn-db/main/staging/compat.json` |
-| Dev | `.../versholn-db/main/dev/compat.json` |
+| Production | `.../versholn_db/main/compat.json` |
+| Staging | `.../versholn_db/main/staging/compat.json` |
+| Dev | `.../versholn_db/main/dev/compat.json` |
 
 Staging can run newer SHAs than prod without any image difference. The same `nielsoln-be` image serves
 all three environments — differentiated only by the compat URL in the Cloud Run service config.
@@ -959,7 +959,7 @@ an instant answer to "what's deployed?" without digging into logs.
     "geo_tools": "9c94dce",
     "versholn":  "4c63ed9"
   },
-  "compat_url": "https://raw.githubusercontent.com/davidnoz123/versholn-db/main/compat.json",
+  "compat_url": "https://raw.githubusercontent.com/davidnoz123/versholn_db/main/compat.json",
   "bootstrapped_at": "2026-04-13T10:00:00Z"
 }
 ```
