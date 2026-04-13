@@ -115,6 +115,16 @@ def _pin_raw_url(raw_url: str, sha: str) -> str:
         return raw_url
 
 
+def _repo_name_from_url(url: str) -> str:
+    """Derive a short directory name from a repo URL.
+    e.g. https://github.com/user/geo_tools.git -> geo_tools
+    """
+    name = url.rstrip("/").split("/")[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name or url
+
+
 def version_info() -> dict:
     """Return version metadata for the current runtime environment.
 
@@ -170,9 +180,10 @@ def bootstrap(
     clone_root_path.mkdir(parents=True, exist_ok=True)
 
     my_sha = _git(Path(__file__).parent, ["rev-parse", "HEAD"])
+    my_url = _git(Path(__file__).parent, ["remote", "get-url", "origin"])
     repos = compat.get("repos", {})
 
-    versholn_entry = repos.get("versholn")
+    versholn_entry = repos.get(my_url) if my_url else None
     versholn_needs_update = (
         versholn_entry is not None
         and my_sha
@@ -182,14 +193,13 @@ def bootstrap(
 
     cloned: dict = {}
 
-    for repo_name, repo_info in repos.items():
-        if repo_name == "versholn":
+    for url, repo_info in repos.items():
+        if url == my_url:
             continue
         sha = repo_info["sha"]
-        url = repo_info["url"]
         is_private = repo_info.get("private", False)
-        dest = clone_root_path / repo_name
-        _log.info("versholn.bootstrap: cloning %s @ %s", repo_name, sha)
+        dest = clone_root_path / _repo_name_from_url(url)
+        _log.info("versholn.bootstrap: cloning %s @ %s", _repo_name_from_url(url), sha)
         _clone_at_sha(url, sha, dest, pat=pat if is_private else None)
         _prepend_path(str(dest))
         cloned[url] = sha
@@ -204,18 +214,18 @@ def bootstrap(
 
     if versholn_needs_update:
         new_sha = versholn_entry["sha"]
-        dest = clone_root_path / "versholn"
+        dest = clone_root_path / _repo_name_from_url(my_url)
         _log.info("versholn.bootstrap: self-update %s -> %s", my_sha, new_sha)
-        _clone_at_sha(versholn_entry["url"], new_sha, dest, pat=None)
+        _clone_at_sha(my_url, new_sha, dest, pat=None)
         _prepend_path(str(dest))
         import versholn as _new
         importlib.reload(_new)
         _new._bootstrap_state.update(_bootstrap_state)
-        _new._bootstrap_state["repos"][versholn_entry["url"]] = new_sha
+        _new._bootstrap_state["repos"][my_url] = new_sha
         return _new
 
     if versholn_entry:
-        _bootstrap_state["repos"][versholn_entry["url"]] = versholn_entry["sha"]
+        _bootstrap_state["repos"][my_url] = versholn_entry["sha"]
     return sys.modules[__name__]
 
 
