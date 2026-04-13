@@ -787,3 +787,128 @@ bootstrap logs and run records can be processed by the same tooling.
 Versionholn run records (`run_start`/`run_finish` JSONL) are **not** logs — they are the audit trail
 for versholn-tracked operations and live in `runs.jsonl`. Logs are ephemeral and go to stdout/stderr.
 The two are complementary: logs for real-time observability, run records for post-hoc analysis.
+
+---
+
+## Local Dev — The Checkout-is-Truth Rule
+
+When running locally, versholn **never consults the compat record and never clones anything**. Whatever
+SHA is currently checked out in each sibling directory is what runs. This is intentional:
+
+> **Locally, your working tree is authoritative. Compat is a production concern.**
+
+This means:
+- `importx` uses the sibling convention — `../geo_tools/` as-is, no version check
+- `versholn.toml` is not read for resolution locally — only for tooling/docs purposes
+- Dirty repos, unpushed commits, and experimental branches all work without ceremony
+- `bootstrap()` and `entrypoint.py` are never invoked locally
+
+The `[deps]` section in `versholn.toml` still serves a useful purpose locally: it documents which
+sibling repos are expected to exist. A future `versholn check` command can warn if a declared dep is
+missing from your local sibling tree.
+
+---
+
+## Operational Safety
+
+### Unreachable Compat Record
+
+If `compat.json` cannot be fetched at cold start (network error, versholn-db down):
+
+| Behaviour | Setting | When to use |
+|---|---|---|
+| **Fail closed** (default) | `on_compat_unavailable = "fail"` | Production — never start with unknown deps |
+| **Use baked fallback** | `on_compat_unavailable = "baked"` | High-availability services — start with baked versholn, log WARNING |
+
+The baked fallback uses whatever was pip-installed into the image at build time. Combined with Docker
+layer caching (SHA-pinned deps), this gives a safe fallback without cloning anything.
+
+Configure in `versholn.toml`:
+```toml
+[versholn]
+on_compat_unavailable = "fail"   # default
+```
+
+Or via env var for per-revision override:
+```
+VERSHOLN_ON_COMPAT_UNAVAILABLE = baked
+```
+
+### Rollback
+
+If a bad compat record causes a container crash loop, the fix does not require an image rebuild:
+
+1. **Fast path** — set `VERSHOLN_ANCHOR_<REPO>=<known-good-sha>` in the Cloud Run revision env vars
+2. **Stable path** — point `VERSHOLN_COMPAT_URL` to a pinned historical record:
+   ```
+   VERSHOLN_COMPAT_URL = https://raw.githubusercontent.com/davidnoz123/versholn-db/main/history/2026-04-13-compat.json
+   ```
+3. **Nuclear option** — Cloud Run revision rollback to a previous revision (reverts all env vars + image)
+
+The `history/` directory in versholn-db is kept for exactly this purpose — every promoted compat record
+is archived with a timestamp before being overwritten.
+
+### Cold Start Latency
+
+`git clone` on every cold start adds latency (typically 2–5s depending on repo size). Mitigations:
+
+| Mitigation | Trade-off |
+|---|---|
+| `min-instances = 1` in Cloud Run | Keeps one instance warm; small ongoing cost |
+| `--depth 1` shallow clone | Fastest clone; SHA ancestry checks not possible (affects `min_sha` constraint) |
+| Deps layer in Docker image | Bake frequently-used stable deps; only clone unstable/changing ones |
+| Clone cache volume | Mount a persistent volume; re-use clones across restarts (Cloud Run not yet supported) |
+
+Default recommendation: use `--depth 1` shallow clones + `min-instances = 1` for production services.
+
+### Multiple PATs
+
+If different private repos require different credentials:
+
+```
+VERSHOLN_PAT_GEO_TOOLS = ghp_...    ← repo-specific (VERSHOLN_PAT_<REPO_NAME_UPPERCASE>)
+GITHUB_PAT             = ghp_...    ← fallback for all other private repos
+```
+
+Bootstrap checks for a repo-specific PAT first, falls back to `GITHUB_PAT`.
+
+---
+
+## CLI (Planned)
+
+The Minimal v0 design defers the CLI. Bootstrap adds the following planned commands:
+
+| Command | Description |
+|---|---|
+| `versholn promote` | Resolve current local SHA set, validate compat constraints, write + push `compat.json` to versholn-db |
+| `versholn check` | Validate local checkouts against current compat record; warn on dirty/mismatched repos |
+| `versholn anchor <repo> <sha>` | Set a committed anchor in `versholn.toml` for a repo |
+| `versholn run <config>` | (v0) Run a configured set of repos as a versholn session |
+| `versholn list` | (v0) List registered repos and their run history |
+
+`versholn promote` is the critical path for the bootstrap architecture — it is how a developer publishes
+a new set of known-good SHAs after testing locally.
+
+---
+
+## Local Docker Testing Workflow
+
+Before deploying to Cloud Run, test the full bootstrap locally:
+
+```powershell
+# 1. Build the generic image
+docker build -t nielsoln-be be/
+
+# 2. Run with bootstrap config — simulates Cloud Run environment
+docker run --rm `
+  -e VERSHOLN_COMPAT_URL=https://raw.githubusercontent.com/davidnoz123/versholn-db/main/compat.json `
+  -e VERSHOLN_SERVICE_ID=nielsoln_site `
+  -e GITHUB_PAT=<your-pat> `
+  -p 8080:8080 `
+  nielsoln-be
+
+# 3. Verify
+curl http://localhost:8080/api/health
+```
+
+Add this to AGENTS.md alongside the local uvicorn command once `entrypoint.py` is implemented.
