@@ -1076,3 +1076,46 @@ compat record, unreachable repo), the health endpoint never returns 200 → prob
 automatically rolls back to the previous revision.
 
 This makes the startup probe the **first line of defence** against a bad compat record deploy.
+
+---
+
+## Known Risks and Current Limitations
+
+### 1. Manual compat.json Promotion — No Pre-Flight Validation
+
+`versholn_db/compat.json` is currently edited and pushed by hand. There is no automated check that:
+- the SHAs exist and are reachable
+- all deps can actually be cloned with the current PAT
+- the app boots successfully against the new SHA set
+
+A typo or bad SHA goes straight to production. The next cold start fails.
+
+**Mitigation path:** `versholn promote` CLI command (planned) — resolves current local SHA set,
+test-clones each dep, then writes and pushes compat.json only on success.
+
+**Immediate workaround:** After any manual compat.json push, watch Cloud Run logs for the next
+cold start to confirm bootstrap succeeded.
+
+### 2. Single PAT — No Expiry Detection
+
+`GITHUB_PAT` is a single token covering all private repos. If it expires or is revoked:
+- Every cold start fails silently at the `git fetch` step
+- No health check differentiation between "PAT expired" and "bad SHA"
+- No proactive alerting
+
+**Mitigation path:** Per-repo PATs (`VERSHOLN_PAT_<REPO_NAME_UPPERCASE>`), PAT rotation monitoring.
+
+**Immediate workaround:** Set PAT expiry reminders. The `github-pat` Secret Manager secret should
+be updated and the Cloud Run service redeployed before expiry.
+
+### 3. No Bootstrap Caching Across Restarts
+
+Every cold start clones all deps from scratch. With `--depth 1` this is fast (~2–5s per repo), but
+it means:
+- GitHub rate limits could block bootstrap under heavy scale-out
+- Cold start latency is proportional to the number of deps
+
+**Mitigation path:** Bake stable deps into the image; only clone deps that change frequently.
+Alternatively, use a persistent volume for clone caching (not yet supported on Cloud Run at scale).
+
+**Immediate workaround:** `min-instances = 1` keeps one instance warm, reducing cold start frequency.
