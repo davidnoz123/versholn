@@ -277,3 +277,161 @@ version alongside the calling repo. For third-party packages that might not be i
 The cache is module-level in `versholn.py`, keyed by the full dotted symbol string. It is **not** invalidated
 during a process lifetime — `importx` is designed for stable, long-lived imports (typically one per
 function call site). It is idempotent: calling it 10,000 times has the same cost as calling it twice.
+
+---
+
+## Runtime Bootstrap — Cloud Deploy Architecture
+
+### Problem
+
+The current production Dockerfile bakes own-repo deps (`versholn`, `geo_tools`) into the image via
+`pip install git+https://...`. This means **every dep change requires a full Docker rebuild and redeploy**,
+adding several minutes of friction. The image is also tightly coupled to specific repo states that were
+current at build time.
+
+### Vision
+
+> The Docker image ships only a minimal baked versholn. On startup, versholn fetches a compat record,
+> clones all deps at their pinned SHAs (including a fresh versholn if needed), and hands control to the
+> updated system. **Updating a dep requires no image rebuild — only a compat record update.**
+
+---
+
+### versholn-db Repo
+
+A new public GitHub repo — `versholn-db` — is the single source of truth for known-good SHA combinations.
+
+```
+versholn-db/
+  compat.json        ← the current promoted compat set
+  history/           ← archived compat records (future)
+```
+
+`compat.json` format:
+```json
+{
+  "schema": 1,
+  "promoted_at": "2026-04-13T10:00:00Z",
+  "repos": {
+    "versholn":  { "sha": "4c63ed9", "url": "https://github.com/davidnoz123/versholn.git" },
+    "geo_tools": { "sha": "9c94dce", "url": "https://github.com/davidnoz123/geo_tools.git", "private": true }
+  }
+}
+```
+
+**Public repo** — compat records contain only SHAs and metadata, no secrets. Any consumer can fetch
+`compat.json` via raw GitHub URL with no auth.
+
+---
+
+### `versholn.bootstrap()` Function
+
+New function in `versholn.py`. Called at container startup (from `entrypoint.py`).
+
+```python
+versholn.bootstrap(
+    compat_url="https://raw.githubusercontent.com/davidnoz123/versholn-db/main/compat.json",
+    clone_root="/app/deps",
+    pat=os.environ.get("GITHUB_PAT"),
+)
+```
+
+**What it does:**
+
+1. Fetches `compat.json` via `urllib` (no extra deps)
+2. For each repo in the compat record:
+   - Shallow-clones to `<clone_root>/<repo>/` at the specified SHA
+   - For private repos: injects PAT into clone URL
+   - Prepends the cloned repo dir to `sys.path`
+3. If versholn itself is in the compat record and its SHA differs from the baked version:
+   - Clones the new versholn, reloads the module (`importlib.reload`)
+   - Returns the reloaded versholn module so the caller can rebind it
+
+**git clone mechanics note:** `git clone --depth 1` on a specific SHA doesn't work directly. Approach:
+```bash
+git init <dir>
+git remote add origin <url>
+git fetch --depth 1 origin <sha>
+git checkout FETCH_HEAD
+```
+SHA is verified after checkout.
+
+---
+
+### `entrypoint.py` — Two-Stage Startup
+
+New file in `be/`. Replaces `uvicorn main:app ...` as the container `CMD`.
+
+```
+Stage 1 (baked versholn):
+  → fetch compat.json
+  → if versholn SHA differs: clone new versholn, reload module
+  → rebind versholn to updated version
+
+Stage 2 (fresh versholn):
+  → call versholn.bootstrap() for all remaining repos
+  → exec uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+`exec` is used (not subprocess) so uvicorn becomes PID 1 — Cloud Run signal handling works correctly.
+
+---
+
+### Dockerfile (Simplified)
+
+Once bootstrap is in place, `GITHUB_TOKEN` is no longer needed at build time:
+
+```dockerfile
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Bake in the versholn bootstrapper only
+RUN pip install --no-cache-dir "git+https://github.com/davidnoz123/versholn.git#egg=versholn"
+
+COPY . .
+
+ENV PORT=8080
+CMD ["python", "entrypoint.py"]
+```
+
+No `ARG GITHUB_TOKEN`. No `secretEnv` in `cloudbuild.yaml`. PAT moves to Cloud Run runtime env.
+
+---
+
+### PAT — Build Time → Runtime
+
+| | Current | After bootstrap |
+|---|---|---|
+| PAT needed at | Docker build | Container startup |
+| PAT lives in | Cloud Build Secret Manager | Cloud Run secret env var |
+| Secret name | `github-pat` | `github-pat` (same, already exists) |
+| Exposed to | Cloud Build SA | Cloud Run identity only |
+
+Cloud Run already has Secret Manager access — `GITHUB_PAT` can be mounted as an env var directly from
+`github-pat` secret in the Cloud Run service config.
+
+---
+
+### Compat Promotion (Deferred)
+
+How and who updates `compat.json` is deferred. Options:
+- **Manual** — developer runs a versholn CLI command after validating, which writes and pushes `compat.json`
+- **Automated** — CI promotes after a test suite passes
+
+The versholn design (run recording → compat promotion) is already architected for this. Promotion logic
+will be added to versholn when a second consumer exists.
+
+---
+
+### Local Dev — Unchanged
+
+Locally, `importx` and the sibling convention continue to work as-is. `bootstrap()` is never called
+locally — `entrypoint.py` is only the production container entry point. The local server command
+(in AGENTS.md) remains the same.
