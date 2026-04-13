@@ -539,3 +539,83 @@ The config service and versholn-db are complementary:
 7. versholn self-updates if its SHA in compat differs from baked
 8. exec <entrypoint>  ← uvicorn/other becomes PID 1
 ```
+
+---
+
+## Logging Policy
+
+### Why Structured Logs Matter Here
+
+The bootstrap sequence runs before the app starts — before uvicorn, before any framework logging is
+active. Without structured logs from that phase, cold-start failures and SHA resolution problems are
+very hard to diagnose in Cloud Run. A consistent log format from first byte to last makes the whole
+pipeline queryable.
+
+### Library
+
+Python's stdlib `logging` module, configured to emit **JSON to stdout**. No third-party dep.
+Cloud Run captures stdout/stderr automatically and makes it queryable in Cloud Logging.
+
+```python
+import json, logging, sys
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "schema": 1,
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+            **getattr(record, "extra", {}),
+        })
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(_JsonFormatter())
+logging.basicConfig(handlers=[handler], level=logging.INFO)
+```
+
+Log level controlled by `VERSHOLN_LOG_LEVEL` env var (default: `INFO`). Set `DEBUG` during local dev
+to see full SHA resolution steps.
+
+### Log Envelope
+
+All versholn-emitted logs share the JSONL-compatible envelope:
+
+```json
+{"schema": 1, "level": "INFO", "logger": "versholn.bootstrap", "msg": "...", ...extra...}
+```
+
+This is consistent with the run-record schema — same `schema` field, same structural style — so
+bootstrap logs and run records can be processed by the same tooling.
+
+### What to Log Per Phase
+
+| Phase | Level | What | Example extra fields |
+|---|---|---|---|
+| Bootstrap start | INFO | Service id, compat URL fetched | `service_id`, `compat_url` |
+| Repo resolved | INFO | Repo name + SHA that will be cloned | `repo`, `sha` |
+| Constraint check pass | DEBUG | Repo + constraint satisfied | `repo`, `constraint` |
+| Constraint check fail | ERROR | Repo + which constraint failed | `repo`, `constraint`, `required`, `got` |
+| Clone complete | INFO | Repo, SHA, duration ms | `repo`, `sha`, `duration_ms` |
+| versholn self-update | INFO | Old SHA → new SHA | `old_sha`, `new_sha` |
+| Bootstrap complete | INFO | Total duration, repos cloned | `duration_ms`, `repos` |
+| Entrypoint exec | INFO | Command about to exec | `entrypoint` |
+| App error | ERROR | Exception type + message only | `exc_type`, `exc_msg` |
+
+### What Must Never Be Logged
+
+- `GITHUB_PAT` or any credential / secret
+- Full tracebacks in minimal mode (exception type + message only)
+- PII — addresses, names, or any user-supplied data
+- Full git URLs that contain the PAT (strip auth before logging)
+
+### Stderr vs Stdout
+
+- `INFO` / `DEBUG` → **stdout** (Cloud Run streams these to Cloud Logging as plain logs)
+- `WARNING` / `ERROR` / `CRITICAL` → **stderr** (Cloud Run flags these as error-severity automatically)
+
+### Run Records vs Logs
+
+Versionholn run records (`run_start`/`run_finish` JSONL) are **not** logs — they are the audit trail
+for versholn-tracked operations and live in `runs.jsonl`. Logs are ephemeral and go to stdout/stderr.
+The two are complementary: logs for real-time observability, run records for post-hoc analysis.
