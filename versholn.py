@@ -1,10 +1,18 @@
+import datetime
 import importlib
+import json
+import logging
+import shutil
 import subprocess
 import sys
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+_log = logging.getLogger(__name__)
+
 _importx_cache: dict = {}
+_bootstrap_state: dict = {}  # populated by bootstrap(); read by health endpoints
 
 
 @dataclass
@@ -68,3 +76,105 @@ def importx(dotted: str, *, local: str | None = None):
 def _prepend_path(p: str) -> None:
     if p not in sys.path:
         sys.path.insert(0, p)
+
+
+def bootstrap(
+    compat_url: str,
+    clone_root: str = "/app/deps",
+    pat: str | None = None,
+):
+    """Fetch compat.json, clone all pinned deps, prepend to sys.path.
+
+    Call from entrypoint.py at container startup only — never in local dev.
+    Returns this module, possibly reloaded if versholn self-updates.
+    """
+    _log.info("versholn.bootstrap: fetching compat record from %s", compat_url)
+
+    with urllib.request.urlopen(compat_url, timeout=30) as resp:
+        compat = json.loads(resp.read().decode())
+
+    clone_root_path = Path(clone_root)
+    clone_root_path.mkdir(parents=True, exist_ok=True)
+
+    my_sha = _git(Path(__file__).parent, ["rev-parse", "HEAD"])
+    repos = compat.get("repos", {})
+
+    versholn_entry = repos.get("versholn")
+    versholn_needs_update = (
+        versholn_entry is not None
+        and my_sha
+        and not versholn_entry["sha"].startswith(my_sha)
+        and not my_sha.startswith(versholn_entry["sha"])
+    )
+
+    cloned: dict = {}
+
+    for repo_name, repo_info in repos.items():
+        if repo_name == "versholn":
+            continue
+        sha = repo_info["sha"]
+        url = repo_info["url"]
+        is_private = repo_info.get("private", False)
+        dest = clone_root_path / repo_name
+        _log.info("versholn.bootstrap: cloning %s @ %s", repo_name, sha)
+        _clone_at_sha(url, sha, dest, pat=pat if is_private else None)
+        _prepend_path(str(dest))
+        cloned[repo_name] = sha
+
+    _bootstrap_state.update({
+        "compat_url": compat_url,
+        "bootstrapped_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "repos": cloned,
+    })
+
+    if versholn_needs_update:
+        new_sha = versholn_entry["sha"]
+        dest = clone_root_path / "versholn"
+        _log.info("versholn.bootstrap: self-update %s -> %s", my_sha, new_sha)
+        _clone_at_sha(versholn_entry["url"], new_sha, dest, pat=None)
+        _prepend_path(str(dest))
+        import versholn as _new
+        importlib.reload(_new)
+        _new._bootstrap_state.update(_bootstrap_state)
+        _new._bootstrap_state["repos"]["versholn"] = new_sha
+        return _new
+
+    _bootstrap_state["repos"]["versholn"] = my_sha
+    return sys.modules[__name__]
+
+
+def _clone_at_sha(url: str, sha: str, dest: Path, *, pat: str | None = None) -> None:
+    """Shallow-clone a repo at a specific SHA into dest."""
+    clone_url = _inject_pat(url, pat) if pat else url
+
+    if dest.exists():
+        actual = _git(dest, ["rev-parse", "HEAD"])
+        if actual and (actual == sha or actual.startswith(sha) or sha.startswith(actual)):
+            _log.debug("versholn._clone_at_sha: %s already at %s, skipping", dest.name, sha)
+            return
+        shutil.rmtree(dest)
+
+    dest.mkdir(parents=True, exist_ok=True)
+    _run(["git", "-C", str(dest), "init"])
+    _run(["git", "-C", str(dest), "remote", "add", "origin", clone_url])
+    _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", sha])
+    _run(["git", "-C", str(dest), "checkout", "FETCH_HEAD"])
+
+    actual = _git(dest, ["rev-parse", "HEAD"])
+    if not actual:
+        raise RuntimeError(f"_clone_at_sha: could not verify SHA after clone of {url}")
+    if not (actual == sha or actual.startswith(sha) or sha.startswith(actual)):
+        raise RuntimeError(f"_clone_at_sha: SHA mismatch — expected {sha!r}, got {actual!r}")
+
+
+def _inject_pat(url: str, pat: str) -> str:
+    """Insert a PAT into a GitHub HTTPS URL: https://github.com/... -> https://<pat>@github.com/..."""
+    if "://" not in url:
+        return url
+    scheme, rest = url.split("://", 1)
+    return f"{scheme}://{pat}@{rest}"
+
+
+def _run(cmd: list) -> None:
+    """Run a subprocess, raising CalledProcessError on failure. Stdout suppressed; stderr passes through."""
+    subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
