@@ -311,18 +311,74 @@ versholn_db/
 ```json
 {
   "schema": 1,
-  "promoted_at": "2026-04-13T10:00:00Z",
+  "promoted_at": "2026-04-14T00:00:00Z",
   "repos": {
-    "versholn":  { "sha": "4dcd31bc8fa2dba68bd9cc20c825ed9564b3053f", "url": "https://github.com/davidnoz123/versholn.git" },
-    "geo_tools": { "sha": "9c94dceb90ae6928afa41ec44dfd079064573ded", "url": "https://github.com/davidnoz123/geo_tools.git", "private": true }
+    "https://github.com/davidnoz123/versholn.git":  { "sha": "4050bcfe6bf14c50ff8016dfa280e48891d101cd" },
+    "https://github.com/davidnoz123/geo_tools.git": { "sha": "9c94dceb90ae6928afa41ec44dfd079064573ded", "private": true }
   }
 }
 ```
+
+**Repos are keyed by their GitHub URL** — no redundant `url` field inside the value. The URL is the canonical identity of a repo; short names were dropped because they created dual-representation redundancy and would complicate future cross-repo compat merging (two different `compat.json` files might both have a `"geo_tools"` key meaning different things; URLs are globally unambiguous).
 
 **SHAs must be full 40-character object SHAs.** Short SHAs are not accepted — `git fetch --depth 1 origin <sha>` requires the full SHA.
 
 **Public repo** — compat records contain only SHAs and metadata, no secrets. Any consumer can fetch
 `compat.json` via raw GitHub URL with no auth.
+
+---
+
+### `compat.json` Schema Evolution
+
+`schema: 1` is the current format. Two additions are reserved for future schemas:
+
+**`schema: 2` — `$extends` (cross-repo compat inheritance)**
+
+Allows a node's `compat.json` to extend a base compat from another repo. Useful when multiple nodes share a common base set of pinned deps:
+
+```json
+{
+  "schema": 2,
+  "$extends": "https://raw.githubusercontent.com/.../base-compat.json",
+  "repos": {
+    "https://github.com/user/my-extra-dep.git": { "sha": "abc123..." }
+  }
+}
+```
+
+Merge rule: local `repos` entries override inherited ones (URL key equality). `bootstrap()` handles deduplication — URL-keyed repos are globally unambiguous across merged files.
+
+**`schema: 2` (or later) — `pip` section (build-time packages)**
+
+Allows pip packages to be declared in `compat.json` alongside repo deps, enabling a versholn-aware build step to generate or validate `requirements.txt` at image build time:
+
+```json
+{
+  "schema": 2,
+  "repos": { ... },
+  "pip": {
+    "osmnx": ">=2.0.0",
+    "geopandas": ">=1.0.0",
+    "shapely": ">=2.0.0"
+  }
+}
+```
+
+Note the timing difference: `repos` entries are cloned at **container startup** (runtime). `pip` entries must be installed at **image build time** — a two-stage Dockerfile or a build-step script would read `compat.json` to generate the install list before baking the image. This avoids heavy pip installs happening during Cloud Build on every deploy.
+
+Neither `$extends` nor `pip` are implemented yet. `schema: 2` is their reserved upgrade slot.
+
+---
+
+### versholn Self-Detection in `bootstrap()`
+
+Versionholn identifies its own entry in `compat.json` by comparing the current module's git remote URL against the repo keys — **not** by a hardcoded `"versholn"` string. This means:
+
+- Forks work correctly as long as their remote URL matches their `compat.json` key
+- Renaming the repo directory doesn't break self-detection
+- A node that doesn't include versholn in its `compat.json` simply skips the self-update step
+
+The local `git remote get-url origin` call is made at bootstrap time; if the module has no git remote (e.g. installed from a wheel with no `.git` dir), self-update is skipped gracefully.
 
 ---
 
