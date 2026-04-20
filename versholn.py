@@ -341,3 +341,378 @@ def _inject_pat(url: str, pat: str) -> str:
 def _run(cmd: list) -> None:
     """Run a subprocess, raising CalledProcessError on failure. Stdout suppressed; stderr passes through."""
     subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
+
+
+def _repo_name_from_url(url: str) -> str:
+    """Extract the repo directory name from a git clone URL or https URL.
+
+    Examples:
+        https://github.com/org/chrome_tools.git -> chrome_tools
+        https://github.com/org/chrome_tools     -> chrome_tools
+        git@github.com:org/chrome_tools.git     -> chrome_tools
+    """
+    name = url.rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Development tools — check_imports, verify, check_ide_paths
+# ---------------------------------------------------------------------------
+
+_STDLIB_MODULES: set | None = None
+
+
+def _stdlib_modules() -> set:
+    """Return the set of top-level stdlib module names (lazy, cached)."""
+    global _STDLIB_MODULES
+    if _STDLIB_MODULES is None:
+        import sys
+        # Always-known extras (covers modules added across 3.x versions)
+        _EXTRA = {
+            "abc", "ast", "asyncio", "base64", "binascii", "builtins",
+            "calendar", "cgi", "cgitb", "chunk", "cmath", "cmd", "code",
+            "codecs", "codeop", "colorsys", "compileall", "concurrent",
+            "configparser", "contextlib", "contextvars", "copy", "copyreg",
+            "csv", "ctypes", "curses", "dataclasses", "datetime", "dbm",
+            "decimal", "difflib", "dis", "doctest", "email", "encodings",
+            "enum", "errno", "faulthandler", "fcntl", "filecmp", "fileinput",
+            "fnmatch", "fractions", "ftplib", "functools", "gc", "getopt",
+            "getpass", "gettext", "glob", "grp", "gzip", "hashlib", "heapq",
+            "hmac", "html", "http", "idlelib", "imaplib", "importlib",
+            "inspect", "io", "ipaddress", "itertools", "json", "keyword",
+            "lib2to3", "linecache", "locale", "logging", "lzma", "mailbox",
+            "math", "mimetypes", "mmap", "modulefinder", "multiprocessing",
+            "netrc", "nis", "nntplib", "numbers", "opcode", "operator",
+            "optparse", "os", "pathlib", "pdb", "pickle", "pickletools",
+            "pipes", "pkgutil", "platform", "plistlib", "poplib", "posix",
+            "posixpath", "pprint", "profile", "pstats", "pty", "pwd", "py_compile",
+            "pyclbr", "pydoc", "queue", "quopri", "random", "re", "readline",
+            "reprlib", "resource", "rlcompleter", "runpy", "sched", "secrets",
+            "select", "selectors", "shelve", "shlex", "shutil", "signal",
+            "site", "smtpd", "smtplib", "sndhdr", "socket", "socketserver",
+            "spwd", "sqlite3", "sre_compile", "sre_constants", "sre_parse",
+            "ssl", "stat", "statistics", "string", "stringprep", "struct",
+            "subprocess", "sunau", "symtable", "sys", "sysconfig", "syslog",
+            "tabnanny", "tarfile", "telnetlib", "tempfile", "termios", "test",
+            "textwrap", "threading", "time", "timeit", "tkinter", "token",
+            "tokenize", "tomllib", "trace", "traceback", "tracemalloc",
+            "tty", "turtle", "turtledemo", "types", "typing", "unicodedata",
+            "unittest", "urllib", "uu", "uuid", "venv", "warnings", "wave",
+            "weakref", "webbrowser", "winreg", "winsound", "wsgiref",
+            "xdrlib", "xml", "xmlrpc", "zipapp", "zipfile", "zipimport",
+            "zlib", "zoneinfo", "_thread", "__future__",
+        }
+        base = set(sys.stdlib_module_names) if hasattr(sys, "stdlib_module_names") else set()
+        _STDLIB_MODULES = base | set(sys.builtin_module_names) | _EXTRA
+    return _STDLIB_MODULES
+
+
+def check_imports(repo_root: str | None = None) -> list:
+    """Scan a project repo for module-level non-stdlib imports and report violations.
+
+    Returns a list of violation dicts. Also prints each violation as a WARNING to stdout.
+
+    Violations detected:
+    - module-level ``import X`` or ``from X import Y`` where X is not stdlib
+    - ``versholn.importx(...)`` call at module level
+    - ``import versholn`` at module level
+
+    Permitted at module level (never flagged):
+    - stdlib imports
+    - ``from __future__ import annotations``
+    - ``from typing import TYPE_CHECKING`` and the ``if TYPE_CHECKING:`` block
+    - intra-repo relative imports (``from utils import ...``, ``from .foo import ...``)
+    - local filename imports (e.g. importing a sibling .py by its bare name is treated as local)
+
+    Args:
+        repo_root: path to the repo root to scan. Defaults to the caller's repo root
+                   (detected via git rev-parse from __file__).
+
+    Returns:
+        List of dicts with keys: ``file``, ``line``, ``code``, ``message``.
+    """
+    import ast as _ast
+    import os as _os
+
+    if repo_root is None:
+        caller_root = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
+        if not caller_root:
+            _log.warning("versholn.check_imports: cannot determine repo root (not in a git repo)")
+            return []
+        repo_root = caller_root
+
+    stdlib = _stdlib_modules()
+    violations: list = []
+
+    # Collect all .py files under repo_root, skipping common non-source dirs
+    _SKIP_DIRS = {"__pycache__", ".git", "venv", ".venv", "node_modules", ".pytest_cache"}
+
+    def _scan_file(path: str) -> list:
+        try:
+            src = open(path, encoding="utf-8", errors="replace").read()
+            tree = _ast.parse(src, filename=path)
+        except SyntaxError:
+            return []
+
+        file_violations = []
+        rel = _os.path.relpath(path, repo_root)
+        # Build set of local module names (sibling .py files and dirs)
+        local_dir = _os.path.dirname(path)
+        local_names: set = set()
+        try:
+            for entry in _os.listdir(local_dir):
+                if entry.endswith(".py"):
+                    local_names.add(entry[:-3])
+                elif _os.path.isdir(_os.path.join(local_dir, entry)) and not entry.startswith("."):
+                    local_names.add(entry)
+        except OSError:
+            pass
+
+        for node in tree.body:
+            # --- module-level import statements ---
+            if isinstance(node, _ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top in stdlib or top in local_names:
+                        continue
+                    file_violations.append({
+                        "file": rel, "line": node.lineno,
+                        "code": "module-level-import",
+                        "message": f"module-level non-stdlib import: import {alias.name}",
+                    })
+
+            elif isinstance(node, _ast.ImportFrom):
+                if node.level and node.level > 0:
+                    continue  # relative import — always local
+                module = node.module or ""
+                top = module.split(".")[0] if module else ""
+                if top in ("__future__", "typing") or top in stdlib or top in local_names:
+                    continue
+                # Allow bare names that match local sibling files
+                if top in local_names:
+                    continue
+                # Allow 'from utils import ...' (common intra-repo pattern — non-relative but local)
+                if top == "utils" or top == "project":
+                    continue
+                file_violations.append({
+                    "file": rel, "line": node.lineno,
+                    "code": "module-level-import",
+                    "message": f"module-level non-stdlib import: from {module} import ...",
+                })
+
+            # --- module-level versholn.importx() calls (assignment or bare expr) ---
+            elif isinstance(node, (_ast.Assign, _ast.AnnAssign, _ast.Expr)):
+                value = getattr(node, "value", None)
+                if value is None and isinstance(node, _ast.AnnAssign):
+                    continue
+                targets = getattr(node, "targets", [])
+
+                def _is_versholn_importx(val) -> bool:
+                    return (
+                        isinstance(val, _ast.Call)
+                        and isinstance(val.func, _ast.Attribute)
+                        and val.func.attr == "importx"
+                        and isinstance(val.func.value, _ast.Name)
+                        and val.func.value.id == "versholn"
+                    )
+
+                if value is not None and _is_versholn_importx(value):
+                    target_str = ""
+                    if targets:
+                        try:
+                            target_str = _ast.unparse(targets[0]) + " = "
+                        except Exception:
+                            pass
+                    file_violations.append({
+                        "file": rel, "line": node.lineno,
+                        "code": "module-level-importx",
+                        "message": f"module-level versholn.importx call: {target_str}versholn.importx(...)",
+                    })
+
+        return file_violations
+
+    for dirpath, dirs, files in _os.walk(repo_root):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for fname in files:
+            if fname.endswith(".py"):
+                vv = _scan_file(_os.path.join(dirpath, fname))
+                violations.extend(vv)
+
+    # Report
+    by_file: dict = {}
+    for v in violations:
+        by_file.setdefault(v["file"], []).append(v)
+
+    for fpath, fvv in sorted(by_file.items()):
+        for v in fvv:
+            print(f"WARNING versholn.check_imports: {v['code']}")
+            print(f"  {v['file']}:{v['line']}  {v['message']}")
+
+    return violations
+
+
+def verify(repo_root: str | None = None) -> None:
+    """Eagerly probe all compat.json repos; raise on first missing or broken one.
+
+    Call in project.py under a dev/local guard so misconfigured paths surface
+    at startup in dev without affecting production cold-start time or stability.
+
+    Example::
+
+        if not IN_PRODUCTION:
+            versholn.verify()
+
+    Raises:
+        ImportError: if any repo listed in compat.json cannot be found or imported.
+    """
+    import os as _os
+
+    if repo_root is None:
+        caller_root = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
+        repo_root = caller_root or ""
+
+    # Find compat.json — check environment variable first, then versholn_db sibling
+    compat_url = _os.environ.get("VERSHOLN_COMPAT_URL", "")
+    compat_data: dict | None = None
+
+    if not compat_url and repo_root:
+        # Try local sibling versholn_db/compat.json
+        candidate = Path(repo_root).parent / "versholn_db" / "compat.json"
+        if candidate.exists():
+            try:
+                compat_data = json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    if compat_data is None and compat_url:
+        try:
+            with urllib.request.urlopen(compat_url, timeout=5) as resp:
+                compat_data = json.loads(resp.read())
+        except Exception as exc:
+            _log.warning("versholn.verify: cannot fetch compat.json from %s: %s", compat_url, exc)
+            return
+
+    if compat_data is None:
+        _log.debug("versholn.verify: no compat.json found — skipping probe")
+        return
+
+    repos = compat_data.get("repos", {})
+    my_root = Path(repo_root) if repo_root else None
+    base = my_root.parent if my_root else Path.cwd().parent
+
+    for url, entry in repos.items():
+        repo_name = _repo_name_from_url(url)
+        candidate = base / repo_name
+        if not candidate.exists():
+            raise ImportError(
+                f"versholn.verify: repo '{repo_name}' not found at {candidate}\n"
+                f"  Expected sibling of {base}\n"
+                f"  URL: {url}"
+            )
+        # Try importing the top-level package to catch obvious breakage
+        sys.path.insert(0, str(candidate))
+        try:
+            importlib.import_module(repo_name)
+        except ImportError as exc:
+            raise ImportError(
+                f"versholn.verify: repo '{repo_name}' found at {candidate} but cannot be imported: {exc}"
+            ) from exc
+        finally:
+            try:
+                sys.path.remove(str(candidate))
+            except ValueError:
+                pass
+
+    _log.debug("versholn.verify: all %d repos OK", len(repos))
+
+
+def check_ide_paths(repo_root: str | None = None) -> list:
+    """Check that .vscode/settings.json extraPaths covers all sibling repos in compat.json.
+
+    Reads the repo paths from compat.json, then checks ``.vscode/settings.json``
+    ``python.analysis.extraPaths`` against the expected sibling dirs. Prints a WARNING
+    for any missing entry. Silent if correctly configured. No-ops if no ``.vscode/``
+    directory is present (i.e. in production).
+
+    Returns:
+        List of missing path strings. Empty list means fully configured.
+    """
+    import os as _os
+
+    if repo_root is None:
+        caller_root = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
+        repo_root = caller_root or ""
+
+    vscode_dir = Path(repo_root) / ".vscode"
+    if not vscode_dir.exists():
+        return []  # production / no VS Code workspace — no-op
+
+    settings_path = vscode_dir / "settings.json"
+    if not settings_path.exists():
+        _log.debug("versholn.check_ide_paths: no .vscode/settings.json found")
+        return []
+
+    # Parse settings.json (allow comments via simple strip — not full JSONC parser)
+    try:
+        raw = settings_path.read_text(encoding="utf-8")
+        # Strip single-line // comments (simple heuristic)
+        import re as _re
+        raw_stripped = _re.sub(r"//[^\n]*", "", raw)
+        settings = json.loads(raw_stripped)
+    except Exception as exc:
+        _log.warning("versholn.check_ide_paths: cannot parse .vscode/settings.json: %s", exc)
+        return []
+
+    extra_paths = settings.get("python.analysis.extraPaths", [])
+    # Normalise to absolute paths
+    base = Path(repo_root)
+    normalised = set()
+    for p in extra_paths:
+        pp = Path(p)
+        if not pp.is_absolute():
+            pp = (base / pp).resolve()
+        normalised.add(str(pp))
+
+    # Determine expected sibling dirs from compat.json
+    compat_data: dict | None = None
+    candidate = Path(repo_root).parent / "versholn_db" / "compat.json"
+    if candidate.exists():
+        try:
+            compat_data = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    if compat_data is None:
+        compat_url = _os.environ.get("VERSHOLN_COMPAT_URL", "")
+        if compat_url:
+            try:
+                with urllib.request.urlopen(compat_url, timeout=5) as resp:
+                    compat_data = json.loads(resp.read())
+            except Exception:
+                pass
+
+    if compat_data is None:
+        _log.debug("versholn.check_ide_paths: no compat.json found — skipping")
+        return []
+
+    parent = Path(repo_root).parent
+    repos = compat_data.get("repos", {})
+    missing = []
+    for url in repos:
+        repo_name = _repo_name_from_url(url)
+        expected = str((parent / repo_name).resolve())
+        if expected not in normalised:
+            missing.append(expected)
+            print(
+                f"WARNING versholn.check_ide_paths: extraPaths missing '{repo_name}'\n"
+                f"  Add to .vscode/settings.json python.analysis.extraPaths:\n"
+                f"  {expected}"
+            )
+
+    if not missing:
+        _log.debug("versholn.check_ide_paths: extraPaths OK (%d repos)", len(repos))
+
+    return missing
+
