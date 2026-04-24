@@ -53,3 +53,17 @@ versholn.check_ide_paths("<path-to-repo-root>") # warns if .vscode extraPaths is
 
 Before editing any `.py` file, run `versholn.check_imports()` to see current violations.
 Fix violations in the file being edited first, then let ripple-out guide remaining work.
+
+---
+
+## Code Editing Policy
+
+### Syntax-check after every Python edit
+
+After editing any `.py` file, immediately verify it parses cleanly before committing:
+
+```powershell
+& "C:\analytics\projects\git\lexi\demos\venv\Scripts\python.exe" -m py_compile path\to\edited_file.py
+```
+
+A `SyntaxError` or `IndentationError` at module level causes a completely silent crash when the process runs in a background window (VBA-spawned or `subprocess.Popen`) — stderr is invisible, the process dies before any log call, and the only symptom the user sees is a timeout.
