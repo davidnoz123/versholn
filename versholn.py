@@ -59,6 +59,8 @@ def importx(dotted: str, *, local: str | None = None):
     if len(parts) < 2:
         raise ImportError(f"versholn.importx: dotted must include a module and attribute, got: {dotted!r}")
 
+    _sibling_checked: Path | None = None
+
     if local is not None:
         p = Path(local)
         if not p.exists():
@@ -69,6 +71,7 @@ def importx(dotted: str, *, local: str | None = None):
         caller_root = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
         if caller_root:
             sibling = Path(caller_root).parent / top_pkg
+            _sibling_checked = sibling
             if sibling.exists():
                 _prepend_path(str(sibling))
 
@@ -84,7 +87,22 @@ def importx(dotted: str, *, local: str | None = None):
         except (ImportError, AttributeError):
             continue
 
-    raise ImportError(f"versholn.importx: cannot resolve {dotted!r}")
+    # Build a helpful error message explaining what was checked and what to do.
+    top_pkg = parts[0]
+    lines = [f"versholn.importx: cannot resolve {dotted!r}"]
+    if _sibling_checked is not None:
+        if not _sibling_checked.exists():
+            lines.append(f"  Looked for sibling dir: {_sibling_checked}  ← NOT FOUND")
+            lines.append(f"  The repo '{top_pkg}' is not cloned on this machine.")
+            lines.append(f"  Fix: clone it as a sibling of {_sibling_checked.parent}")
+            lines.append(f"       e.g.  cd {_sibling_checked.parent}")
+            lines.append(f"             git clone <url-for-{top_pkg}>")
+        else:
+            lines.append(f"  Sibling dir exists: {_sibling_checked}")
+            lines.append(f"  But the symbol could not be resolved inside it.")
+            lines.append(f"  Check that '{'.'.join(parts[:1])}' is importable from that dir.")
+    lines.append(f"  Run versholn.doctor() to check all required repos at once.")
+    raise ImportError("\n".join(lines))
 
 
 def install_and_import(package_spec: str, *, import_as: str | None = None):
@@ -715,4 +733,193 @@ def check_ide_paths(repo_root: str | None = None) -> list:
         _log.debug("versholn.check_ide_paths: extraPaths OK (%d repos)", len(repos))
 
     return missing
+
+
+def doctor(repo_root: str | None = None, *, base_dir: str | None = None) -> list:
+    """Check all required sibling repos and print a full diagnosis table.
+
+    Reads compat.json (from a sibling versholn_db/ dir or VERSHOLN_COMPAT_URL env var),
+    then checks every listed repo against the expected sibling base directory.
+
+    For each repo it reports:
+    - MISSING   — directory not found; prints the clone command
+    - WRONG SHA — directory exists but is at a different commit
+    - OK        — present and at the expected SHA
+
+    Never raises. Returns a list of problem dicts so callers can act on them.
+
+    Args:
+        repo_root: path to the calling repo root (detected from versholn's own git root
+                   if omitted).
+        base_dir:  override the sibling base directory (default: parent of repo_root).
+
+    Example::
+
+        import versholn
+        versholn.doctor()
+    """
+    import os as _os
+
+    if repo_root is None:
+        caller_root = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
+        repo_root = caller_root or ""
+
+    base = Path(base_dir) if base_dir else (Path(repo_root).parent if repo_root else Path.cwd().parent)
+
+    # Resolve compat.json
+    compat_data: dict | None = None
+    compat_url = _os.environ.get("VERSHOLN_COMPAT_URL", "")
+
+    if repo_root:
+        candidate = Path(repo_root).parent / "versholn_db" / "compat.json"
+        if candidate.exists():
+            try:
+                compat_data = json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    if compat_data is None and compat_url:
+        try:
+            with urllib.request.urlopen(compat_url, timeout=5) as resp:
+                compat_data = json.loads(resp.read())
+        except Exception as exc:
+            print(f"versholn.doctor: cannot fetch compat.json: {exc}")
+
+    if compat_data is None:
+        print("versholn.doctor: no compat.json found — cannot check repos")
+        print(f"  Tried: sibling versholn_db/compat.json and VERSHOLN_COMPAT_URL env var")
+        return []
+
+    repos = compat_data.get("repos", {})
+    if not repos:
+        print("versholn.doctor: compat.json has no repos section — nothing to check")
+        return []
+
+    print(f"versholn.doctor — repo dependency check")
+    print(f"  base dir: {base}")
+    print()
+
+    col_w = max((len(_repo_name_from_url(u)) for u in repos), default=12) + 2
+    problems = []
+
+    for url, entry in repos.items():
+        name = _repo_name_from_url(url)
+        expected_sha = entry["sha"] if isinstance(entry, dict) else entry
+        expected_short = expected_sha[:12]
+        path = base / name
+
+        if not path.exists():
+            status = "MISSING  "
+            detail = f"git clone {url}"
+            problems.append({"repo": name, "status": "missing", "url": url, "expected_sha": expected_sha, "path": str(path)})
+        else:
+            actual_sha = _git(path, ["rev-parse", "HEAD"])
+            actual_short = actual_sha[:12] if actual_sha else "unknown"
+            if not actual_sha:
+                status = "NO GIT   "
+                detail = f"dir exists but is not a git repo: {path}"
+                problems.append({"repo": name, "status": "no-git", "url": url, "path": str(path)})
+            elif actual_sha.startswith(expected_sha[:8]) or expected_sha.startswith(actual_sha[:8]):
+                status = "OK       "
+                detail = f"sha {actual_short}"
+            else:
+                status = "WRONG SHA"
+                detail = f"expected {expected_short}  got {actual_short}"
+                problems.append({"repo": name, "status": "wrong-sha", "url": url,
+                                  "expected_sha": expected_sha, "actual_sha": actual_sha, "path": str(path)})
+
+        print(f"  {name:<{col_w}} {status}  {detail}")
+
+    print()
+    if problems:
+        missing = [p for p in problems if p["status"] == "missing"]
+        other = [p for p in problems if p["status"] != "missing"]
+        if missing:
+            print(f"  {len(missing)} repo(s) missing. Clone commands:")
+            for p in missing:
+                print(f"    cd {base}")
+                print(f"    git clone {p['url']}")
+                if p.get("expected_sha"):
+                    print(f"    git -C {p['repo']} checkout {p['expected_sha']}")
+            print()
+        if other:
+            print(f"  {len(other)} other problem(s) — see details above.")
+        print("  Run versholn.setup() to clone missing repos automatically.")
+    else:
+        print("  All repos OK.")
+
+    return problems
+
+
+def setup(repo_root: str | None = None, *, base_dir: str | None = None, pat: str | None = None) -> None:
+    """Clone any missing repos listed in compat.json into the sibling base directory.
+
+    Runs doctor() first to show a full diagnosis, then clones any missing repos.
+    Skips repos that are already present (regardless of SHA).
+    Does NOT modify existing repos.
+
+    For private repos, pass a GitHub PAT via the ``pat`` argument or set the
+    ``GITHUB_PAT`` environment variable.
+
+    Args:
+        repo_root: path to the calling repo root (detected automatically if omitted).
+        base_dir:  override the sibling base directory (default: parent of repo_root).
+        pat:       GitHub personal access token for private repos.
+
+    Example::
+
+        import versholn
+        versholn.setup()           # auto-detect base dir, use GITHUB_PAT env var
+        versholn.setup(pat="ghp_...")  # explicit PAT
+    """
+    import os as _os
+
+    problems = doctor(repo_root=repo_root, base_dir=base_dir)
+    missing = [p for p in problems if p["status"] == "missing"]
+
+    if not missing:
+        print("versholn.setup: nothing to do — all repos present.")
+        return
+
+    token = pat or _os.environ.get("GITHUB_PAT", "")
+    if not token:
+        print("versholn.setup: WARNING — no GITHUB_PAT found; cloning may fail for private repos.")
+        print("  Set GITHUB_PAT env var or pass pat=<token> to versholn.setup().")
+
+    base = Path(base_dir) if base_dir else None
+    if base is None:
+        if repo_root:
+            base = Path(repo_root).parent
+        else:
+            caller_root = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
+            base = Path(caller_root).parent if caller_root else Path.cwd().parent
+
+    print(f"\nversholn.setup: cloning {len(missing)} missing repo(s) into {base}\n")
+
+    for p in missing:
+        name = p["repo"]
+        url = p["url"]
+        sha = p.get("expected_sha", "")
+        dest = base / name
+        clone_url = _inject_pat(url, token) if token else url
+        print(f"  Cloning {name} ...")
+        try:
+            import subprocess as _sp
+            _sp.check_call(["git", "clone", clone_url, str(dest)],
+                           stdout=_sp.DEVNULL, stderr=_sp.PIPE)
+            if sha:
+                _sp.check_call(["git", "-C", str(dest), "checkout", sha],
+                                stdout=_sp.DEVNULL, stderr=_sp.PIPE)
+            print(f"  {name}: cloned OK{' @ ' + sha[:12] if sha else ''}")
+        except Exception as exc:
+            print(f"  {name}: FAILED — {exc}")
+
+    print("\nversholn.setup: done. Re-run versholn.doctor() to verify.")
+
+
+def _inject_pat(url: str, pat: str) -> str:
+    """Inject a PAT into an https GitHub URL for authenticated cloning."""
+    if pat and url.startswith("https://github.com/"):
+        return url.replace("https://github.com/", f"https://{pat}@github.com/")
+    return url
 
