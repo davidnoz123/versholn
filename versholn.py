@@ -188,16 +188,6 @@ def _pin_raw_url(raw_url: str, sha: str) -> str:
         return raw_url
 
 
-def _repo_name_from_url(url: str) -> str:
-    """Derive a short directory name from a repo URL.
-    e.g. https://github.com/user/geo_tools.git -> geo_tools
-    """
-    name = url.rstrip("/").split("/")[-1]
-    if name.endswith(".git"):
-        name = name[:-4]
-    return name or url
-
-
 def version_info() -> dict:
     """Return version metadata for the current runtime environment.
 
