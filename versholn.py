@@ -1,7 +1,15 @@
+"""versholn — polyrepo coordination and bootstrap library.
+
+REPL usage (workspace alignment):
+    import runpy ; temp = runpy._run_module_as_main("versholn")
+
+Toggle OPERATION in main() before each run.
+"""
 import datetime
 import importlib
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -922,4 +930,421 @@ def _inject_pat(url: str, pat: str) -> str:
     if pat and url.startswith("https://github.com/"):
         return url.replace("https://github.com/", f"https://{pat}@github.com/")
     return url
+
+
+# ---------------------------------------------------------------------------
+# Workspace branch alignment
+# ---------------------------------------------------------------------------
+
+_RELEASE_BRANCH_RE = re.compile(r"^\d+\.\d+$")
+
+
+def latest_release_branch(path) -> "str | None":
+    """Return the highest-versioned N.M release branch for the repo at path.
+
+    Checks local branches first, then remote tracking refs — so it works
+    correctly on a fresh clone where only origin/N.M exists.
+    """
+    p = Path(path).resolve()
+    local = _git(p, ["branch", "--format=%(refname:short)"])
+    remote = _git(p, ["branch", "-r", "--format=%(refname:short)"])
+    seen = set()
+    for line in (local + "\n" + remote).splitlines():
+        b = line.strip()
+        if "/" in b:
+            b = b.split("/", 1)[1]   # strip remote prefix e.g. "origin/0.1" -> "0.1"
+        if _RELEASE_BRANCH_RE.match(b):
+            seen.add(b)
+    if not seen:
+        return None
+    return max(seen, key=lambda b: tuple(int(x) for x in b.split(".")))
+
+
+def branch_for_sha(path, sha) -> "str | None":
+    """Return the N.M release branch whose tip matches sha, or that contains sha.
+
+    Tip-match is preferred over 'contains': if the SHA is the HEAD of a
+    release branch that is the authoritative match. Falls back to any
+    release branch that contains the SHA.
+    """
+    p = Path(path).resolve()
+
+    # Prefer tip-match: branch whose HEAD is sha (local then remote)
+    for flag in ([], ["-r"]):
+        tips = _git(p, ["branch"] + flag + ["--format=%(refname:short) %(objectname)"])
+        for line in tips.splitlines():
+            parts = line.strip().split()
+            if len(parts) != 2:
+                continue
+            bname, tip = parts
+            if "/" in bname:
+                bname = bname.split("/", 1)[1]
+            if _RELEASE_BRANCH_RE.match(bname) and (
+                tip.startswith(sha[:8]) or sha.startswith(tip[:8])
+            ):
+                return bname
+
+    # Fallback: any release branch containing sha
+    for flag in ([], ["-r"]):
+        contains = _git(p, ["branch"] + flag + ["--contains", sha, "--format=%(refname:short)"])
+        for line in contains.splitlines():
+            b = line.strip()
+            if "/" in b:
+                b = b.split("/", 1)[1]
+            if _RELEASE_BRANCH_RE.match(b):
+                return b
+
+    return None
+
+
+def checkout_branch(path, branch, *, dirty_policy="skip") -> dict:
+    """Checkout branch in the repo at path, respecting dirty_policy.
+
+    dirty_policy values:
+        "skip"        — (default) leave dirty repos untouched, return status="skipped"
+        "save_branch" — commit WIP state to wip/versholn-align/{original_branch}/{timestamp},
+                        then checkout target. The WIP branch is a named, permanent,
+                        discoverable artefact — merge or delete it at your leisure.
+
+    Why save_branch instead of git stash: stash is an anonymous LIFO stack.
+    Multiple alignment runs stack entries; stash pop restores the wrong thing if
+    pre-existing stashes exist, and a mid-run crash leaves orphaned entries across
+    many repos with no record of which ones versholn created. save_branch is always
+    safe to re-run and always recoverable via 'git branch | grep wip/versholn-align'.
+
+    Returns a dict: {repo, branch, status, note}
+    status values: "ok", "ok_with_warnings", "already_on_branch", "skipped", "error"
+    """
+    import datetime as _dt
+
+    p = Path(path).resolve()
+    name = p.name
+
+    current = _git(p, ["rev-parse", "--abbrev-ref", "HEAD"])
+    if current == branch:
+        return {"repo": name, "branch": branch, "status": "already_on_branch", "note": ""}
+
+    dirty = _git(p, ["status", "--porcelain"]) != ""
+    wip_branch = None
+
+    if dirty:
+        if dirty_policy == "skip":
+            return {
+                "repo": name, "branch": branch, "status": "skipped",
+                "note": "dirty working tree (dirty_policy='skip')",
+            }
+        elif dirty_policy == "save_branch":
+            ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            wip_branch = f"wip/versholn-align/{current}/{ts}"
+            r = subprocess.run(
+                ["git", "-C", str(p), "checkout", "-b", wip_branch],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                return {"repo": name, "branch": branch, "status": "error",
+                        "note": f"could not create WIP branch {wip_branch!r}: {r.stderr.strip()}"}
+            subprocess.run(["git", "-C", str(p), "add", "-A"],
+                           capture_output=True, text=True)
+            subprocess.run(
+                ["git", "-C", str(p), "commit", "-m",
+                 f"wip: versholn align save from {current!r} — merge or delete when ready"],
+                capture_output=True, text=True,
+            )
+        else:
+            return {"repo": name, "branch": branch, "status": "error",
+                    "note": f"unknown dirty_policy: {dirty_policy!r}"}
+
+    # Fetch so remote-only branches become available locally
+    _git(p, ["fetch", "--no-tags", "origin", branch])
+
+    # Try direct checkout first, then track-remote fallback
+    r = subprocess.run(
+        ["git", "-C", str(p), "checkout", branch],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        r = subprocess.run(
+            ["git", "-C", str(p), "checkout", "-b", branch, f"origin/{branch}"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return {"repo": name, "branch": branch, "status": "error",
+                    "note": f"checkout failed: {r.stderr.strip()}"}
+
+    pull = subprocess.run(
+        ["git", "-C", str(p), "pull", "--ff-only"],
+        capture_output=True, text=True,
+    )
+    notes = []
+    if pull.returncode != 0:
+        notes.append(f"pull --ff-only failed: {pull.stderr.strip()}")
+    if wip_branch:
+        notes.append(f"WIP saved to branch {wip_branch!r} — merge or delete when ready")
+
+    note = "; ".join(notes)
+    status = "ok_with_warnings" if note else "ok"
+    return {"repo": name, "branch": branch, "status": status, "note": note}
+
+
+def align_workspace(
+    root,
+    repos=None,
+    *,
+    overrides=None,
+    compat_path=None,
+    dirty_policy="skip",
+    dirty_overrides=None,
+) -> list:
+    """Align local repos to their appropriate N.M release branches.
+
+    Branch resolution order (first match wins):
+        1. overrides dict  — explicit per-repo override passed by caller
+        2. compat.json     — SHA mapped back to its N.M branch via branch_for_sha()
+        3. latest_release_branch() — highest N.M branch found locally or on remote
+
+    dirty_policy applies to all repos; dirty_overrides is a per-repo dict that
+    overrides dirty_policy for specific repos. An align.json file in the current
+    working directory (the referrer repo) may also supply dirty_overrides; the
+    dirty_overrides argument wins over align.json values.
+
+    # Future: per-pair {(referrer, referee): policy} support planned.
+    # Currently implement per-repo overrides via dirty_overrides dict.
+    # align.json schema: {"dirty_overrides": {"repo_name": "save_branch", ...}}
+
+    Args:
+        root:            Parent directory containing all sibling repos.
+        repos:           List of repo names to align. None = auto-discover from root.
+        overrides:       {repo_name: branch_name} — explicit branch targets.
+        compat_path:     Path to a compat.json file; SHAs mapped to branch names.
+        dirty_policy:    Default dirty handling ("skip" | "save_branch").
+        dirty_overrides: {repo_name: dirty_policy} — per-repo dirty policy.
+
+    Returns:
+        List of result dicts from checkout_branch(), one per repo.
+    """
+    import os as _os
+
+    root = Path(root).resolve()
+    overrides = overrides or {}
+    dirty_overrides = dirty_overrides or {}
+
+    # Load align.json from cwd (referrer repo); caller's dirty_overrides wins
+    align_json_dirty = {}
+    align_json_path = Path(_os.getcwd()) / "align.json"
+    if align_json_path.exists():
+        try:
+            aj = json.loads(align_json_path.read_text(encoding="utf-8"))
+            align_json_dirty = aj.get("dirty_overrides", {})
+        except Exception:
+            pass
+    effective_dirty_overrides = {**align_json_dirty, **dirty_overrides}
+
+    # Auto-discover repos if not specified
+    if repos is None:
+        repos = sorted(
+            d.name for d in root.iterdir()
+            if d.is_dir() and (d / ".git").exists()
+        )
+
+    # Map compat.json SHAs to branch names
+    compat_branches: dict = {}
+    if compat_path:
+        try:
+            compat_data = json.loads(Path(compat_path).read_text(encoding="utf-8"))
+            for url, entry in compat_data.get("repos", {}).items():
+                repo_name = _repo_name_from_url(url)
+                sha = entry["sha"] if isinstance(entry, dict) else entry
+                repo_path = root / repo_name
+                if repo_path.exists():
+                    b = branch_for_sha(repo_path, sha)
+                    if b:
+                        compat_branches[repo_name] = b
+        except Exception as exc:
+            print(f"versholn.align_workspace: warning — could not read compat.json: {exc}")
+
+    results = []
+    for name in repos:
+        path = root / name
+        if not path.exists():
+            results.append({"repo": name, "branch": None,
+                            "status": "not_cloned", "note": ""})
+            continue
+
+        if name in overrides:
+            target = overrides[name]
+        elif name in compat_branches:
+            target = compat_branches[name]
+        else:
+            target = latest_release_branch(path)
+
+        if target is None:
+            results.append({"repo": name, "branch": None,
+                            "status": "no_release_branch",
+                            "note": "no N.M branch found locally or remotely"})
+            continue
+
+        repo_dirty_policy = effective_dirty_overrides.get(name, dirty_policy)
+        results.append(checkout_branch(path, target, dirty_policy=repo_dirty_policy))
+
+    return results
+
+
+def find_combos(repo_root=None) -> list:
+    """Return paths to combo pattern files relevant to the current repo.
+
+    Reads compat.json deps, then checks the sibling nielsoln_project_hub/combos/
+    directory for a file named {a}+{b}.md for each pair of dep repo names
+    (alphabetical order). Returns a list of Path objects for files that exist.
+
+    Call this at the start of any cross-repo implementation to check whether a
+    known-good pattern already exists before writing new glue code.
+
+    Example::
+
+        import versholn
+        for p in versholn.find_combos():
+            print(p)  # e.g. .../combos/excel_tools+local_server_tools.md
+    """
+    import itertools as _it
+
+    if repo_root is None:
+        root_str = _git(Path(__file__).parent, ["rev-parse", "--show-toplevel"])
+        repo_root = root_str or str(Path(__file__).parent)
+
+    lunk_root = Path(repo_root).resolve().parent
+    combos_dir = lunk_root / "nielsoln_project_hub" / "combos"
+
+    # Resolve compat.json dep names
+    compat_data: dict | None = None
+    for candidate in [
+        Path(repo_root) / "compat.json",
+        lunk_root / "versholn_db" / "compat.json",
+    ]:
+        if candidate.exists():
+            try:
+                compat_data = json.loads(candidate.read_text(encoding="utf-8"))
+                break
+            except Exception:
+                pass
+
+    if not compat_data or not combos_dir.exists():
+        return []
+
+    dep_names = sorted(
+        _repo_name_from_url(url)
+        for url in compat_data.get("repos", {})
+    )
+
+    found = []
+    for a, b in _it.combinations(dep_names, 2):
+        p = combos_dir / f"{a}+{b}.md"
+        if p.exists():
+            found.append(p)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# REPL entrypoint
+# ---------------------------------------------------------------------------
+
+def _print_align_results(results):
+    col_w = max((len(r["repo"]) for r in results), default=12) + 2
+    for r in results:
+        branch = r.get("branch") or ""
+        note = r.get("note") or ""
+        note_str = f"  — {note}" if note else ""
+        print(f"  {r['repo']:<{col_w}} {r['status']:<22} {branch}{note_str}")
+    print()
+    ok      = sum(1 for r in results if r["status"] in ("ok", "already_on_branch", "ok_with_warnings"))
+    skipped = sum(1 for r in results if r["status"] == "skipped")
+    errors  = sum(1 for r in results if r["status"] not in (
+        "ok", "already_on_branch", "ok_with_warnings", "skipped", "not_cloned",
+    ))
+    print(f"  {ok} ok, {skipped} skipped (dirty), {errors} error(s)")
+
+
+def main():
+    # --- Toggle this before each run ---
+    OPERATION = "status"
+    # Options:
+    #   "status"           — print branch state of all sibling repos
+    #   "align_latest"     — checkout latest N.M branch in every sibling repo
+    #   "align_to_compat"  — align to branches matching TARGET_REPO's compat.json
+
+    TARGET_REPO      = "video_annotation"   # whose compat.json to read (align_to_compat)
+    BRANCH_OVERRIDES = {}                   # e.g. {"chrome_tools": "0.1"} — wins over compat
+    DIRTY_POLICY     = "skip"               # "skip" | "save_branch"
+    DIRTY_OVERRIDES  = {}                   # e.g. {"chrome_tools": "stash_pop"}
+    # ------------------------------------
+
+    root = Path(__file__).resolve().parent.parent   # versholn's grandparent = lunk root
+
+    if OPERATION == "status":
+        repos = sorted(
+            d.name for d in root.iterdir()
+            if d.is_dir() and (d / ".git").exists()
+        )
+        print(f"\n=== Workspace Branch Status ({root}) ===\n")
+        warnings = 0
+        col_w = max((len(n) for n in repos), default=12) + 2
+        for name in repos:
+            path = root / name
+            info = load_repo(path)
+            dirty_marker = "*" if info.dirty else ""
+            latest = latest_release_branch(path)
+            flag = ""
+            if info.branch == "main" and latest:
+                flag = f"  *** ON MAIN — latest release branch is {latest} ***"
+                warnings += 1
+            elif info.branch == "main":
+                flag = "  (no release branch found)"
+            print(f"  {name:<{col_w}} {info.branch}@{info.sha[:7]}{dirty_marker}{flag}")
+        print()
+        if warnings:
+            print(f"  WARNING: {warnings} repo(s) are on 'main' but have a release branch.")
+            print("  Run OPERATION='align_latest' to fix.")
+        return 0
+
+    elif OPERATION == "align_latest":
+        print(f"\n=== Align to Latest Release Branches ({root}) ===\n")
+        results = align_workspace(
+            root, dirty_policy=DIRTY_POLICY, dirty_overrides=DIRTY_OVERRIDES,
+        )
+        _print_align_results(results)
+        return 0
+
+    elif OPERATION == "align_to_compat":
+        compat_path = root / TARGET_REPO / "compat.json"
+        if not compat_path.exists():
+            compat_path = root / "versholn_db" / "compat.json"
+        if not compat_path.exists():
+            print(f"ERROR: could not find compat.json for {TARGET_REPO!r}")
+            print(f"  Tried: {root / TARGET_REPO / 'compat.json'}")
+            return 1
+        print(f"\n=== Align to Compat ({compat_path}) ===\n")
+        results = align_workspace(
+            root,
+            overrides=BRANCH_OVERRIDES,
+            compat_path=str(compat_path),
+            dirty_policy=DIRTY_POLICY,
+            dirty_overrides=DIRTY_OVERRIDES,
+        )
+        _print_align_results(results)
+        return 0
+
+    else:
+        print(f"ERROR: Unknown OPERATION: {OPERATION!r}")
+        return 1
+
+
+if __name__ == "__main__":
+    import traceback as _traceback
+    _stderr_log = lambda msg: print(msg, file=sys.stderr)  # noqa: E731
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        _stderr_log(f"FATAL unhandled exception:\n{_traceback.format_exc()}")
+        raise
 
